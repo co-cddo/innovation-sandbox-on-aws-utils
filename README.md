@@ -1,0 +1,137 @@
+# Innovation Sandbox Pool Account Creator
+
+Automates the creation and registration of new pool accounts for AWS Innovation Sandbox.
+
+## Prerequisites
+
+- Python 3.x
+- AWS CLI configured with SSO profiles:
+  - `NDX/orgManagement` - Access to AWS Organizations
+  - `NDX/InnovationSandboxHub` - Access to Innovation Sandbox Lambda functions
+- Access to the Innovation Sandbox AWS Organization
+
+## Setup
+
+```bash
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install boto3
+```
+
+## Usage
+
+### Create a new pool account
+
+```bash
+source venv/bin/activate
+python create_sandbox_pool_account.py
+```
+
+### Recover a partially provisioned account
+
+If account creation failed partway through, you can resume by providing the account ID:
+
+```bash
+source venv/bin/activate
+python create_sandbox_pool_account.py 123456789012
+```
+
+The script will check the account's current location:
+- **In root**: Moves to Entry OU, then registers with Innovation Sandbox
+- **In Entry OU**: Registers with Innovation Sandbox
+- **Elsewhere**: Returns an error (account may already be processed)
+
+## What it does
+
+The script performs the following steps:
+
+1. **🔑 SSO Authentication** - Validates existing sessions, only prompts for login if needed
+2. **📋 List existing accounts** - Finds all `pool-NNN` accounts in the organization
+3. **🆕 Create new account** - Creates the next sequential pool account (e.g., `pool-009`)
+4. **📦 Move to Entry OU** - Moves the account to `ou-2laj-2by9v0sr` (Entry OU)
+5. **📝 Register with Innovation Sandbox** - Invokes the ISB Lambda to register the account
+6. **🧹 Wait for cleanup** - Polls until the account is moved to `ou-2laj-oihxgbtr` (Ready OU)
+7. **🎉 Report** - Displays total time taken
+
+## Account naming
+
+- Account names follow the pattern `pool-NNN` (e.g., `pool-001`, `pool-002`)
+- Email addresses use the format: `ndx-try-provider+gds-ndx-try-aws-pool-NNN@dsit.gov.uk`
+
+## Configuration
+
+The following constants can be modified in the script:
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `ENTRY_OU` | `ou-2laj-2by9v0sr` | OU where new accounts are placed for registration |
+| `SANDBOX_READY_OU` | `ou-2laj-oihxgbtr` | OU where accounts are moved after cleanup |
+| `check_interval` | `5` seconds | How often to check for OU move |
+| `max_wait` | `3600` seconds (1 hour) | Maximum time to wait for cleanup |
+
+## How it works
+
+The script bypasses CloudFront authentication by directly invoking the Innovation Sandbox Lambda function (`ISB-AccountsLambdaFunction-ndx`) with a mock JWT token. The Lambda only decodes (doesn't verify) the JWT, allowing direct API calls with Admin privileges.
+
+## Example output
+
+```
+============================================================
+🔑 STEP 1: AWS SSO Authentication
+============================================================
+  ✅ NDX/orgManagement - session valid
+  ✅ NDX/InnovationSandboxHub - session valid
+
+============================================================
+📋 STEP 2: List existing pool accounts
+============================================================
+Fetching accounts from AWS Organizations...
+
+📊 Found 8 accounts starting with 'pool-':
+
+Account ID      Name                                     Status       Email
+----------------------------------------------------------------------------------------------------
+449788867583    pool-001                                 ACTIVE       ndx-try-provider+gds-ndx-try-aws-pool-001@dsit.gov.uk
+...
+
+   Total: 8 pool accounts
+
+============================================================
+🆕 STEP 3: Create new account
+============================================================
+   Account name: pool-009
+   Email: ndx-try-provider+gds-ndx-try-aws-pool-009@dsit.gov.uk
+   Request ID: car-abc123...
+   ✅ Account created: 123456789012
+
+============================================================
+📦 STEP 4: Move to Entry OU
+============================================================
+   📍 From: r-2laj
+   📍 To:   ou-2laj-2by9v0sr
+   ✅ Move complete
+
+============================================================
+📝 STEP 5: Register with Innovation Sandbox
+============================================================
+   🎯 Account: 123456789012
+   λ  Lambda: ISB-AccountsLambdaFunction-ndx
+   ✅ Registered successfully!
+   📄 Status: CleanUp
+
+============================================================
+🧹 STEP 6: Wait for Innovation Sandbox cleanup
+============================================================
+⏳ Waiting for Innovation Sandbox cleanup...
+   Target OU: ou-2laj-oihxgbtr
+   ✅ Account moved to target OU after 8m 45s!
+
+============================================================
+🎉 COMPLETE
+============================================================
+   Account: pool-009 (123456789012)
+   ⏱️  Total time: 12m 34s
+```
