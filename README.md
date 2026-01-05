@@ -52,9 +52,10 @@ The script performs the following steps:
 2. **📋 List existing accounts** - Finds all `pool-NNN` accounts in the organization
 3. **🆕 Create new account** - Creates the next sequential pool account (e.g., `pool-009`)
 4. **📦 Move to Entry OU** - Moves the account to `ou-2laj-2by9v0sr` (Entry OU)
-5. **📝 Register with Innovation Sandbox** - Invokes the ISB Lambda to register the account
-6. **🧹 Wait for cleanup** - Polls until the account is moved to `ou-2laj-oihxgbtr` (Ready OU)
-7. **🎉 Report** - Displays total time taken
+5. **💰 Add to Billing View** - Adds the account to the custom billing view for cost tracking
+6. **📝 Register with Innovation Sandbox** - Invokes the ISB Lambda to register the account
+7. **🧹 Wait for cleanup** - Polls until the account is moved to `ou-2laj-oihxgbtr` (Ready OU)
+8. **🎉 Report** - Displays total time taken
 
 ## Account naming
 
@@ -69,6 +70,7 @@ The following constants can be modified in the script:
 |----------|-------|-------------|
 | `ENTRY_OU` | `ou-2laj-2by9v0sr` | OU where new accounts are placed for registration |
 | `SANDBOX_READY_OU` | `ou-2laj-oihxgbtr` | OU where accounts are moved after cleanup |
+| `BILLING_VIEW_ARN` | `arn:aws:billing::955063685555:billingview/custom-...` | Custom billing view for cost tracking |
 | `check_interval` | `5` seconds | How often to check for OU move |
 | `max_wait` | `3600` seconds (1 hour) | Maximum time to wait for cleanup |
 
@@ -113,6 +115,13 @@ Account ID      Name                                     Status       Email
    📍 From: r-2laj
    📍 To:   ou-2laj-2by9v0sr
    ✅ Move complete
+
+============================================================
+💰 STEP 4.5: Add to Billing View
+============================================================
+   📊 Fetching current billing view...
+   📝 Adding account (total will be 9 accounts)
+   ✅ Added account to billing view
 
 ============================================================
 📝 STEP 5: Register with Innovation Sandbox
