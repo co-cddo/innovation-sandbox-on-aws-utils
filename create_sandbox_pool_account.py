@@ -19,6 +19,9 @@ SANDBOX_READY_OU = "ou-2laj-oihxgbtr"
 ENTRY_OU = "ou-2laj-2by9v0sr"
 ROOT_ID = None  # Will be populated at runtime
 
+# Custom billing view ARN for tracking pool account costs
+BILLING_VIEW_ARN = "arn:aws:billing::955063685555:billingview/custom-466e2613-e09b-4787-a93a-736f0fb1564b"
+
 
 def check_sso_session(profile_name):
     """Check if SSO session is valid for the given profile."""
@@ -163,6 +166,54 @@ def get_account_ou(session, account_id):
     if response['Parents']:
         return response['Parents'][0]['Id']
     return None
+
+
+def add_account_to_billing_view(session, account_id):
+    """Add an account to the custom billing view.
+
+    Uses read-modify-write pattern since there's no incremental add API.
+    Continues with warning on failure (non-blocking).
+    """
+    try:
+        billing_client = session.client('billing')
+
+        # Get current billing view
+        print(f"   📊 Fetching current billing view...")
+        response = billing_client.get_billing_view(arn=BILLING_VIEW_ARN)
+        billing_view = response['billingView']
+
+        # Get existing accounts from the filter expression
+        data_filter = billing_view.get('dataFilterExpression', {})
+        dimensions = data_filter.get('dimensions', {})
+        existing_accounts = dimensions.get('values', [])
+
+        # Check if account already exists
+        if account_id in existing_accounts:
+            print(f"   ℹ️  Account {account_id} already in billing view")
+            return True
+
+        # Add new account
+        updated_accounts = existing_accounts + [account_id]
+        print(f"   📝 Adding account (total will be {len(updated_accounts)} accounts)")
+
+        # Update billing view
+        billing_client.update_billing_view(
+            arn=BILLING_VIEW_ARN,
+            dataFilterExpression={
+                'dimensions': {
+                    'key': 'LINKED_ACCOUNT',
+                    'values': updated_accounts
+                }
+            }
+        )
+
+        print(f"   ✅ Added account to billing view")
+        return True
+
+    except Exception as e:
+        print(f"   ⚠️  Warning: Failed to add account to billing view: {e}")
+        print(f"   ℹ️  Continuing with remaining steps...")
+        return False
 
 
 def wait_for_ou_move(session, account_id, target_ou, check_interval=5, max_wait=3600):
@@ -325,6 +376,12 @@ def main():
             print("\n❌ Recovery failed - exiting")
             sys.exit(1)
 
+        # Add to billing view for recovered accounts
+        print(f"\n{'='*60}")
+        print(f"💰 Add to Billing View")
+        print(f"{'='*60}")
+        add_account_to_billing_view(session, account_id)
+
         account_name = f"(existing account {account_id})"
     else:
         # Normal mode - create a new account
@@ -371,6 +428,11 @@ def main():
         print(f"📦 STEP 4: Move to Entry OU")
         print(f"{'='*60}")
         move_account_to_ou(session, account_id, ENTRY_OU, source_parent_id=get_root_id(session))
+
+        print(f"\n{'='*60}")
+        print(f"💰 STEP 4.5: Add to Billing View")
+        print(f"{'='*60}")
+        add_account_to_billing_view(session, account_id)
 
     print(f"\n{'='*60}")
     print(f"📝 STEP 5: Register with Innovation Sandbox")
