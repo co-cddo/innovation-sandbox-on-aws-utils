@@ -454,6 +454,20 @@ def main():
     print(f"   Account: {account_name} ({account_id})")
     print(f"   ⏱️  Total time: {format_duration(total_duration)}")
 
+    print(f"\n{'='*60}")
+    print(f"⚠️  NEXT STEP: Update Cost Controls")
+    print(f"{'='*60}")
+    print(f"   Run Terraform to create budgets for the new pool account:")
+    print(f"")
+    print(f"   cd terraform-scp-overrides/environments/ndx-production")
+    print(f"   terraform plan")
+    print(f"   terraform apply")
+    print(f"")
+    print(f"   This will automatically discover the new account and create:")
+    print(f"   - Per-account daily budget ($50/day)")
+    print(f"   - Per-account monthly budget ($1000/month)")
+    print(f"   - Budget alerts and automated actions")
+
 
 if __name__ == '__main__':
     main()
