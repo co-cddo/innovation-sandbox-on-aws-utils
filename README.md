@@ -5,10 +5,10 @@ Automates the creation and registration of new pool accounts for AWS Innovation 
 ## Prerequisites
 
 - Python 3.x
-- AWS CLI configured with SSO profiles:
+- AWS CLI configured with SSO profile:
   - `NDX/orgManagement` - Access to AWS Organizations
-  - `NDX/InnovationSandboxHub` - Access to Innovation Sandbox Lambda functions
 - Access to the Innovation Sandbox AWS Organization
+- Access to AWS Secrets Manager (for JWT signing secret)
 
 ## Setup
 
@@ -53,7 +53,7 @@ The script performs the following steps:
 3. **🆕 Create new account** - Creates the next sequential pool account (e.g., `pool-009`)
 4. **📦 Move to Entry OU** - Moves the account to `ou-2laj-2by9v0sr` (Entry OU)
 5. **💰 Add to Billing View** - Adds the account to the custom billing view for cost tracking
-6. **📝 Register with Innovation Sandbox** - Invokes the ISB Lambda to register the account
+6. **📝 Register with Innovation Sandbox** - Calls the ISB API Gateway to register the account
 7. **🧹 Wait for cleanup** - Polls until the account is moved to `ou-2laj-oihxgbtr` (Ready OU)
 8. **🎉 Report** - Displays total time taken
 
@@ -74,9 +74,16 @@ The following constants can be modified in the script:
 | `check_interval` | `5` seconds | How often to check for OU move |
 | `max_wait` | `3600` seconds (1 hour) | Maximum time to wait for cleanup |
 
+The following can be configured via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ISB_API_BASE_URL` | `https://1ewlxhaey6.execute-api.us-west-2.amazonaws.com/prod` | Innovation Sandbox API Gateway base URL |
+| `ISB_JWT_SECRET_PATH` | `/InnovationSandbox/ndx/Auth/JwtSecret` | Secrets Manager path for JWT signing secret |
+
 ## How it works
 
-The script bypasses CloudFront authentication by directly invoking the Innovation Sandbox Lambda function (`ISB-AccountsLambdaFunction-ndx`) with a mock JWT token. The Lambda only decodes (doesn't verify) the JWT, allowing direct API calls with Admin privileges.
+The script registers accounts with Innovation Sandbox by calling the HTTP API Gateway endpoint (`POST /accounts`) with a signed HS256 JWT token. The JWT signing secret is fetched from AWS Secrets Manager and the token is signed using Python's `hmac` + `hashlib` (no external JWT library needed).
 
 ## Example output
 
@@ -85,7 +92,6 @@ The script bypasses CloudFront authentication by directly invoking the Innovatio
 🔑 STEP 1: AWS SSO Authentication
 ============================================================
   ✅ NDX/orgManagement - session valid
-  ✅ NDX/InnovationSandboxHub - session valid
 
 ============================================================
 📋 STEP 2: List existing pool accounts
@@ -126,8 +132,9 @@ Account ID      Name                                     Status       Email
 ============================================================
 📝 STEP 5: Register with Innovation Sandbox
 ============================================================
+   🔑 Fetching JWT secret...
    🎯 Account: 123456789012
-   λ  Lambda: ISB-AccountsLambdaFunction-ndx
+   🌐 API: POST https://1ewlxhaey6.execute-api.us-west-2.amazonaws.com/prod/accounts
    ✅ Registered successfully!
    📄 Status: CleanUp
 

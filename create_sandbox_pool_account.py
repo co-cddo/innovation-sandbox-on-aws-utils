@@ -2,16 +2,21 @@
 """
 List AWS Organization accounts that start with 'pool-' and create the next one.
 Uses the NDX/orgManagement profile for Organizations API.
-Uses NDX/InnovationSandboxHub profile for Lambda invocation.
+Uses HTTP API Gateway with JWT authentication for Innovation Sandbox registration.
 """
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
+import os
 import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import boto3
 
 # Target OU where Innovation Sandbox moves accounts after cleanup
@@ -21,6 +26,16 @@ ROOT_ID = None  # Will be populated at runtime
 
 # Custom billing view ARN for tracking pool account costs
 BILLING_VIEW_ARN = "arn:aws:billing::955063685555:billingview/custom-466e2613-e09b-4787-a93a-736f0fb1564b"
+
+# Innovation Sandbox API Gateway configuration
+ISB_API_BASE_URL = os.environ.get(
+    'ISB_API_BASE_URL',
+    'https://1ewlxhaey6.execute-api.us-west-2.amazonaws.com/prod'
+)
+ISB_JWT_SECRET_PATH = os.environ.get(
+    'ISB_JWT_SECRET_PATH',
+    '/InnovationSandbox/ndx/Auth/JwtSecret'
+)
 
 
 def check_sso_session(profile_name):
@@ -50,26 +65,43 @@ def ensure_sso_login(profile_name):
     print(f"  ✅ {profile_name} - login successful")
 
 
-def create_mock_jwt():
-    """Create a mock JWT token for direct Lambda invocation.
+def sign_jwt(payload, secret, expires_in_seconds=3600):
+    """Sign a JWT with HS256 algorithm.
 
-    The Lambda only decodes the JWT (doesn't verify signature), so we can
-    create an unsigned token with the required user structure.
+    Args:
+        payload: dict of JWT claims
+        secret: HMAC signing secret
+        expires_in_seconds: token lifetime (default 1 hour)
+
+    Returns:
+        Signed JWT string
     """
-    header = {"alg": "none", "typ": "JWT"}
-    payload = {
-        "user": {
-            "email": "admin@innovation-sandbox.local",
-            "roles": ["Admin"],
-        }
-    }
+    header = {"alg": "HS256", "typ": "JWT"}
+    now = int(time.time())
+    full_payload = {**payload, "iat": now, "exp": now + expires_in_seconds}
 
     def b64_encode(data):
         return base64.urlsafe_b64encode(
             json.dumps(data).encode()
         ).rstrip(b'=').decode()
 
-    return f"{b64_encode(header)}.{b64_encode(payload)}."
+    encoded_header = b64_encode(header)
+    encoded_payload = b64_encode(full_payload)
+
+    signing_input = f"{encoded_header}.{encoded_payload}"
+    signature = hmac.new(
+        secret.encode(), signing_input.encode(), hashlib.sha256
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode()
+
+    return f"{encoded_header}.{encoded_payload}.{encoded_signature}"
+
+
+def get_jwt_secret():
+    """Fetch JWT signing secret from AWS Secrets Manager."""
+    client = boto3.client('secretsmanager', region_name='us-west-2')
+    response = client.get_secret_value(SecretId=ISB_JWT_SECRET_PATH)
+    return response['SecretString']
 
 
 def get_all_accounts(session):
@@ -246,52 +278,43 @@ def wait_for_ou_move(session, account_id, target_ou, check_interval=5, max_wait=
 
 
 def register_with_innovation_sandbox(account_id):
-    """Register the account with Innovation Sandbox by invoking the Lambda directly."""
-    # Use the InnovationSandboxHub profile
-    hub_session = boto3.Session(profile_name='NDX/InnovationSandboxHub')
-    lambda_client = hub_session.client('lambda')
+    """Register the account with Innovation Sandbox via HTTP API Gateway."""
+    url = f"{ISB_API_BASE_URL}/accounts"
 
-    function_name = "ISB-AccountsLambdaFunction-ndx"
-
-    # Create mock JWT for authorization bypass
-    mock_token = create_mock_jwt()
-
-    # Construct API Gateway proxy event payload
-    payload = {
-        "httpMethod": "POST",
-        "path": "/accounts",
-        "body": json.dumps({"awsAccountId": account_id}),
-        "headers": {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {mock_token}",
-        },
-        "requestContext": {},
-        "queryStringParameters": None,
-        "pathParameters": None,
-    }
-
-    print(f"   🎯 Account: {account_id}")
-    print(f"   λ  Lambda: {function_name}")
-    print(f"   ⏳ Invoking...", end="", flush=True)
-
-    response = lambda_client.invoke(
-        FunctionName=function_name,
-        InvocationType='RequestResponse',
-        Payload=json.dumps(payload),
+    # Sign a JWT with Admin credentials
+    print(f"   🔑 Fetching JWT secret...")
+    secret = get_jwt_secret()
+    token = sign_jwt(
+        {"user": {"email": "ndx+utils@dsit.gov.uk", "roles": ["Admin"]}},
+        secret,
     )
 
-    # Parse the response
-    response_payload = json.loads(response['Payload'].read().decode('utf-8'))
+    request_body = json.dumps({"awsAccountId": account_id}).encode()
 
-    if response.get('FunctionError'):
-        print(f"\r   ❌ Lambda execution error!{' ' * 20}")
-        print(f"   Error: {response_payload}")
-        return False
+    print(f"   🎯 Account: {account_id}")
+    print(f"   🌐 API: POST {url}")
+    print(f"   ⏳ Sending request...", end="", flush=True)
 
-    # Parse the Lambda response body
-    status_code = response_payload.get('statusCode', 0)
-    body_str = response_payload.get('body', '{}')
-    body = json.loads(body_str) if body_str else {}
+    req = urllib.request.Request(
+        url,
+        data=request_body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            status_code = response.status
+            body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        status_code = e.code
+        try:
+            body = json.loads(e.read().decode())
+        except (json.JSONDecodeError, Exception):
+            body = {"status": "error", "message": str(e)}
 
     if status_code == 201:
         print(f"\r   ✅ Registered successfully!{' ' * 20}")
@@ -360,7 +383,6 @@ def main():
     print("🔑 STEP 1: AWS SSO Authentication")
     print("=" * 60)
     ensure_sso_login("NDX/orgManagement")
-    ensure_sso_login("NDX/InnovationSandboxHub")
 
     # Create session with the specified profile
     session = boto3.Session(profile_name='NDX/orgManagement')
