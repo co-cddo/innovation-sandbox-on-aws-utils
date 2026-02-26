@@ -10,10 +10,13 @@ user preference data outside the account's resource plane.
 
 This script:
   1. Discovers sandbox accounts from the AWS Organizations OU structure
-  2. Gets SSO role credentials for each ISB permission set on each account
-  3. Calls the CCS APIs to reset console state for that principal
+  2. Temporarily assigns the current user to each ISB permission set on each
+     account (ndx_IsbUsersPS is normally only assigned during active leases)
+  3. Gets SSO role credentials for each permission set
+  4. Calls the CCS APIs to reset console state for that principal
+  5. Removes the temporary permission set assignments
 
-Uses the NDX/orgManagement profile for Organizations API.
+Uses the NDX/orgManagement profile for Organizations and SSO Admin APIs.
 Uses cached SSO access token for SSO role credential acquisition.
 
 Note: CCS state is per-caller (keyed on full assumed-role ARN including session
@@ -26,6 +29,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import boto3
@@ -45,6 +49,8 @@ import urllib.error
 
 SSO_REGION = "us-west-2"
 SSO_START_URL = "https://d-9267e1e371.awsapps.com/start"
+SSO_INSTANCE_ARN = "arn:aws:sso:::instance/ssoins-79078bb87a820e72"
+SSO_IDENTITY_STORE_ID = "d-9267e1e371"
 ORG_PROFILE = "NDX/orgManagement"
 
 # ISB account pool OU structure (children of ndx_InnovationSandboxAccountPool)
@@ -55,11 +61,14 @@ TARGET_OUS = {
 }
 
 # ISB SSO permission sets provisioned to sandbox accounts
-ISB_ROLE_NAMES = [
-    "ndx_IsbUsersPS",
-    "ndx_IsbAdminsPS",
-    "ndx_IsbManagersPS",
-]
+ALL_PERMISSION_SETS = {
+    "ndx_IsbUsersPS":    "arn:aws:sso:::permissionSet/ssoins-79078bb87a820e72/ps-79074793b1df1a84",
+    "ndx_IsbAdminsPS":   "arn:aws:sso:::permissionSet/ssoins-79078bb87a820e72/ps-790724a4fad3095f",
+    "ndx_IsbManagersPS": "arn:aws:sso:::permissionSet/ssoins-79078bb87a820e72/ps-7907c6dd36e49882",
+}
+
+# Default: only clean the user-facing permission set (fastest, covers the common case)
+DEFAULT_PERMISSION_SETS = ["ndx_IsbUsersPS"]
 
 # Console settings to delete (all known CCS setting names)
 CCS_SETTINGS_TO_DELETE = [
@@ -152,6 +161,26 @@ def find_sso_access_token():
     return best_token
 
 
+def get_current_sso_user_id(session):
+    """Get the Identity Store user ID for the current SSO user."""
+    # Get the current user's email from STS
+    sts = session.client("sts")
+    identity = sts.get_caller_identity()
+    # ARN format: arn:aws:sts::ACCOUNT:assumed-role/ROLE_NAME/EMAIL
+    arn = identity["Arn"]
+    email = arn.split("/")[-1]
+
+    ids = session.client("identitystore")
+    response = ids.list_users(
+        IdentityStoreId=SSO_IDENTITY_STORE_ID,
+        Filters=[{"AttributePath": "UserName", "AttributeValue": email}],
+    )
+    users = response.get("Users", [])
+    if not users:
+        raise RuntimeError(f"❌ Could not find SSO user for {email}")
+    return users[0]["UserId"], email
+
+
 # ── Organizations ────────────────────────────────────────────────────────────
 
 def list_accounts_in_ou(session, ou_id):
@@ -164,19 +193,83 @@ def list_accounts_in_ou(session, ou_id):
     return accounts
 
 
-# ── SSO Role Credentials ────────────────────────────────────────────────────
+# ── SSO Permission Set Assignment ────────────────────────────────────────────
 
-def list_sso_roles(sso_client, access_token, account_id):
-    """List SSO roles available on an account for the current user."""
+def create_account_assignment(sso_admin, account_id, permission_set_arn, user_id):
+    """Create a temporary SSO permission set assignment for a user on an account."""
     try:
-        response = sso_client.list_account_roles(
-            accountId=account_id,
-            accessToken=access_token,
+        response = sso_admin.create_account_assignment(
+            InstanceArn=SSO_INSTANCE_ARN,
+            TargetId=account_id,
+            TargetType="AWS_ACCOUNT",
+            PermissionSetArn=permission_set_arn,
+            PrincipalType="USER",
+            PrincipalId=user_id,
         )
-        return [r["roleName"] for r in response.get("roleList", [])]
-    except Exception:
-        return []
+        request_id = response["AccountAssignmentCreationStatus"]["RequestId"]
+        # Wait for the assignment to complete
+        while True:
+            status = sso_admin.describe_account_assignment_creation_status(
+                InstanceArn=SSO_INSTANCE_ARN,
+                AccountAssignmentCreationRequestId=request_id,
+            )["AccountAssignmentCreationStatus"]
+            if status["Status"] == "SUCCEEDED":
+                return True
+            elif status["Status"] == "FAILED":
+                reason = status.get("FailureReason", "unknown")
+                print(f"        ⚠️  Assignment failed: {reason}")
+                return False
+            time.sleep(1)
+    except sso_admin.exceptions.ConflictException:
+        # Already assigned
+        return True
+    except Exception as e:
+        print(f"        ⚠️  Could not assign: {e}")
+        return False
 
+
+def delete_account_assignment(sso_admin, account_id, permission_set_arn, user_id):
+    """Remove an SSO permission set assignment for a user on an account."""
+    try:
+        response = sso_admin.delete_account_assignment(
+            InstanceArn=SSO_INSTANCE_ARN,
+            TargetId=account_id,
+            TargetType="AWS_ACCOUNT",
+            PermissionSetArn=permission_set_arn,
+            PrincipalType="USER",
+            PrincipalId=user_id,
+        )
+        request_id = response["AccountAssignmentDeletionStatus"]["RequestId"]
+        while True:
+            status = sso_admin.describe_account_assignment_deletion_status(
+                InstanceArn=SSO_INSTANCE_ARN,
+                AccountAssignmentDeletionRequestId=request_id,
+            )["AccountAssignmentDeletionStatus"]
+            if status["Status"] in ("SUCCEEDED", "FAILED"):
+                return status["Status"] == "SUCCEEDED"
+            time.sleep(1)
+    except Exception as e:
+        print(f"        ⚠️  Could not remove assignment: {e}")
+        return False
+
+
+def check_account_assignment(sso_admin, account_id, permission_set_arn, user_id):
+    """Check if a user already has a permission set assignment on an account."""
+    try:
+        response = sso_admin.list_account_assignments(
+            InstanceArn=SSO_INSTANCE_ARN,
+            AccountId=account_id,
+            PermissionSetArn=permission_set_arn,
+        )
+        for assignment in response.get("AccountAssignments", []):
+            if assignment.get("PrincipalId") == user_id:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+# ── SSO Role Credentials ────────────────────────────────────────────────────
 
 def get_sso_role_credentials(sso_client, access_token, account_id, role_name):
     """Get temporary credentials for an SSO role on an account."""
@@ -210,7 +303,10 @@ def ccs_request(creds, operation, body):
     httpreq = urllib.request.Request(url, data=payload.encode(), headers=dict(req.headers), method="POST")
     try:
         resp = urllib.request.urlopen(httpreq)
-        return json.loads(resp.read())
+        resp_body = resp.read()
+        if resp_body:
+            return json.loads(resp_body)
+        return {}
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"CCS {operation} returned {e.code}: {body_text}")
@@ -257,6 +353,81 @@ def summarise_state(settings_response):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def get_sso_role_credentials_with_retry(sso_client, access_token, account_id, role_name, retries=5):
+    """Get SSO role credentials, retrying for newly-created assignments that need propagation."""
+    for attempt in range(retries):
+        creds = get_sso_role_credentials(sso_client, access_token, account_id, role_name)
+        if creds:
+            return creds
+        if attempt < retries - 1:
+            wait = 2 ** attempt  # 1, 2, 4, 8, 16s
+            print(f"        ⏳ Waiting {wait}s for assignment to propagate...", end="\r", flush=True)
+            time.sleep(wait)
+    return None
+
+
+def clean_role(sso_client, sso_token, account_id, role_name, dry_run, verbose, newly_assigned=False):
+    """Clean console state for a single role on a single account.
+
+    Returns: "cleaned", "already_clean", or "error"
+    """
+    if newly_assigned:
+        creds = get_sso_role_credentials_with_retry(sso_client, sso_token, account_id, role_name)
+    else:
+        creds = get_sso_role_credentials(sso_client, sso_token, account_id, role_name)
+    if not creds:
+        print(f"        ❌ Could not get credentials")
+        return "error"
+
+    try:
+        settings = get_caller_settings(creds)
+    except RuntimeError as e:
+        print(f"        ❌ Error reading settings: {e}")
+        return "error"
+
+    if not has_console_state(settings):
+        print(f"        ✅ Already clean")
+        return "already_clean"
+
+    print(f"        📊 {summarise_state(settings)}")
+
+    if verbose:
+        print(f"        {json.dumps(settings, indent=8)}")
+
+    if dry_run:
+        print(f"        ℹ️  [DRY RUN] Would delete settings and dashboard")
+        return "already_clean"  # count as no-op for summary
+
+    # Delete settings
+    try:
+        delete_caller_settings(creds)
+        print(f"        🗑️  Deleted settings")
+    except RuntimeError as e:
+        print(f"        ❌ Error deleting settings: {e}")
+        return "error"
+
+    # Delete dashboard
+    try:
+        delete_caller_dashboard(creds)
+        print(f"        🗑️  Deleted dashboard")
+    except RuntimeError as e:
+        print(f"        ❌ Error deleting dashboard: {e}")
+        return "error"
+
+    # Verify
+    try:
+        after = get_caller_settings(creds)
+        if has_console_state(after):
+            print(f"        ⚠️  State still present after cleanup")
+            return "error"
+        else:
+            print(f"        ✅ Verified clean")
+            return "cleaned"
+    except RuntimeError:
+        print(f"        ℹ️  Could not verify (non-fatal)")
+        return "cleaned"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Clean AWS Console state from Innovation Sandbox pool accounts"
@@ -266,11 +437,17 @@ def main():
         help=f"OUs to target (default: all of {', '.join(TARGET_OUS.keys())})",
     )
     parser.add_argument("--account", help="Clean a specific account ID only")
+    parser.add_argument("--all-roles", action="store_true",
+                        help="Clean all ISB permission sets (default: only ndx_IsbUsersPS)")
     parser.add_argument("--dry-run", action="store_true", help="Check state without making changes")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show full settings detail")
     args = parser.parse_args()
 
     target_ous = {name: TARGET_OUS[name] for name in args.ou} if args.ou else TARGET_OUS
+    if args.all_roles:
+        permission_sets = ALL_PERMISSION_SETS
+    else:
+        permission_sets = {k: ALL_PERMISSION_SETS[k] for k in DEFAULT_PERMISSION_SETS}
 
     # ── Step 1: SSO Authentication ──────────────────────────────────────────
     print("=" * 60)
@@ -287,6 +464,11 @@ def main():
 
     org_session = boto3.Session(profile_name=ORG_PROFILE)
     sso_client = org_session.client("sso")
+    sso_admin = org_session.client("sso-admin")
+
+    # Get current user's identity store ID for permission set assignment
+    user_id, user_email = get_current_sso_user_id(org_session)
+    print(f"  👤 {user_email} ({user_id})")
 
     # ── Step 2: Discover accounts ───────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -331,73 +513,50 @@ def main():
         print(f"  📦 {account_id}  {name}  ({ou_name})")
         print(f"  {'─'*56}")
 
-        # Discover which SSO roles are available on this account
-        available_roles = list_sso_roles(sso_client, sso_token, account_id)
-        isb_roles = [r for r in ISB_ROLE_NAMES if r in available_roles]
+        # Track temp assignments for this account so we always clean up
+        account_temp_assignments = []
 
-        if not isb_roles:
-            print(f"     ⚠️  No ISB SSO roles available (found: {available_roles or 'none'})")
-            total_errors += 1
-            continue
+        try:
+            for role_name, ps_arn in permission_sets.items():
+                print(f"\n     🔐 {role_name}")
 
-        for role_name in isb_roles:
-            print(f"\n     🔐 {role_name}")
+                # Check if we already have this assignment
+                already_assigned = check_account_assignment(sso_admin, account_id, ps_arn, user_id)
+                newly_assigned = False
 
-            creds = get_sso_role_credentials(sso_client, sso_token, account_id, role_name)
-            if not creds:
-                print(f"        ❌ Could not get credentials")
-                total_errors += 1
-                continue
+                if not already_assigned:
+                    if args.dry_run:
+                        print(f"        ℹ️  Would temporarily assign {role_name}")
+                    else:
+                        print(f"        📌 Temporarily assigning...", end="", flush=True)
+                        if create_account_assignment(sso_admin, account_id, ps_arn, user_id):
+                            print(f"\r        📌 Temporarily assigned            ")
+                            account_temp_assignments.append((ps_arn, role_name))
+                            newly_assigned = True
+                        else:
+                            total_errors += 1
+                            continue
 
-            try:
-                settings = get_caller_settings(creds)
-            except RuntimeError as e:
-                print(f"        ❌ Error reading settings: {e}")
-                total_errors += 1
-                continue
-
-            if not has_console_state(settings):
-                print(f"        ✅ Already clean")
-                total_already_clean += 1
-                continue
-
-            print(f"        📊 {summarise_state(settings)}")
-
-            if args.verbose:
-                print(f"        {json.dumps(settings, indent=8)}")
-
-            if args.dry_run:
-                print(f"        ℹ️  [DRY RUN] Would delete settings and dashboard")
-                continue
-
-            # Delete settings
-            try:
-                delete_caller_settings(creds)
-                print(f"        🗑️  Deleted settings")
-            except RuntimeError as e:
-                print(f"        ❌ Error deleting settings: {e}")
-                total_errors += 1
-
-            # Delete dashboard
-            try:
-                delete_caller_dashboard(creds)
-                print(f"        🗑️  Deleted dashboard")
-            except RuntimeError as e:
-                print(f"        ❌ Error deleting dashboard: {e}")
-                total_errors += 1
-
-            # Verify
-            try:
-                after = get_caller_settings(creds)
-                if has_console_state(after):
-                    print(f"        ⚠️  State still present after cleanup")
-                    total_errors += 1
-                else:
-                    print(f"        ✅ Verified clean")
+                result = clean_role(sso_client, sso_token, account_id, role_name, args.dry_run, args.verbose, newly_assigned)
+                if result == "cleaned":
                     total_cleaned += 1
-            except RuntimeError:
-                print(f"        ℹ️  Could not verify (non-fatal)")
-                total_cleaned += 1
+                elif result == "already_clean":
+                    total_already_clean += 1
+                else:
+                    total_errors += 1
+
+        except Exception as e:
+            print(f"\n     ❌ Unexpected error: {e}")
+            total_errors += 1
+
+        finally:
+            # Always remove temporary assignments for this account
+            for ps_arn, ps_name in account_temp_assignments:
+                print(f"        🗑️  Removing {ps_name}...", end="", flush=True)
+                if delete_account_assignment(sso_admin, account_id, ps_arn, user_id):
+                    print(f"\r        🗑️  Removed {ps_name}               ")
+                else:
+                    print(f"\r        ⚠️  Failed to remove {ps_name} — clean up manually")
 
     # ── Summary ─────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
