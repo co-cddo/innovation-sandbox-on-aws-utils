@@ -2,16 +2,26 @@
 """
 List AWS Organization accounts that start with 'pool-' and create the next one.
 Uses the NDX/orgManagement profile for Organizations API.
-Uses NDX/InnovationSandboxHub profile for Lambda invocation.
+Uses NDX/InnovationSandboxHub profile for Secrets Manager access.
+
+Requires environment variables:
+  ISB_API_BASE_URL      - Innovation Sandbox API Gateway base URL
+  ISB_JWT_SECRET_PATH   - Secrets Manager path for JWT signing secret
 """
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
+import os
 import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+
 import boto3
 
 # Target OU where Innovation Sandbox moves accounts after cleanup
@@ -50,26 +60,42 @@ def ensure_sso_login(profile_name):
     print(f"  ✅ {profile_name} - login successful")
 
 
-def create_mock_jwt():
-    """Create a mock JWT token for direct Lambda invocation.
+def sign_jwt(payload, secret, expires_in_seconds=3600):
+    """Sign a JWT with HS256 algorithm.
 
-    The Lambda only decodes the JWT (doesn't verify signature), so we can
-    create an unsigned token with the required user structure.
+    Mirrors the TypeScript signJwt() in @co-cddo/isb-client.
     """
-    header = {"alg": "none", "typ": "JWT"}
-    payload = {
-        "user": {
-            "email": "admin@innovation-sandbox.local",
-            "roles": ["Admin"],
-        }
-    }
+    header = {"alg": "HS256", "typ": "JWT"}
+    now = int(time.time())
+    full_payload = {**payload, "iat": now, "exp": now + expires_in_seconds}
 
-    def b64_encode(data):
+    def b64url_encode(data):
         return base64.urlsafe_b64encode(
-            json.dumps(data).encode()
+            json.dumps(data, separators=(',', ':')).encode()
         ).rstrip(b'=').decode()
 
-    return f"{b64_encode(header)}.{b64_encode(payload)}."
+    encoded_header = b64url_encode(header)
+    encoded_payload = b64url_encode(full_payload)
+    signing_input = f"{encoded_header}.{encoded_payload}"
+
+    signature = hmac.new(
+        secret.encode(),
+        signing_input.encode(),
+        hashlib.sha256
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b'=').decode()
+
+    return f"{encoded_header}.{encoded_payload}.{encoded_signature}"
+
+
+def fetch_jwt_secret(session, secret_path):
+    """Fetch JWT signing secret from AWS Secrets Manager."""
+    client = session.client('secretsmanager')
+    response = client.get_secret_value(SecretId=secret_path)
+    secret = response.get('SecretString')
+    if not secret:
+        raise RuntimeError("JWT secret is empty")
+    return secret
 
 
 def get_all_accounts(session):
@@ -246,61 +272,62 @@ def wait_for_ou_move(session, account_id, target_ou, check_interval=5, max_wait=
 
 
 def register_with_innovation_sandbox(account_id):
-    """Register the account with Innovation Sandbox by invoking the Lambda directly."""
-    # Use the InnovationSandboxHub profile
-    hub_session = boto3.Session(profile_name='NDX/InnovationSandboxHub')
-    lambda_client = hub_session.client('lambda')
+    """Register the account with Innovation Sandbox via API Gateway."""
+    api_base_url = os.environ.get("ISB_API_BASE_URL")
+    jwt_secret_path = os.environ.get("ISB_JWT_SECRET_PATH")
 
-    function_name = "ISB-AccountsLambdaFunction-ndx"
-
-    # Create mock JWT for authorization bypass
-    mock_token = create_mock_jwt()
-
-    # Construct API Gateway proxy event payload
-    payload = {
-        "httpMethod": "POST",
-        "path": "/accounts",
-        "body": json.dumps({"awsAccountId": account_id}),
-        "headers": {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {mock_token}",
-        },
-        "requestContext": {},
-        "queryStringParameters": None,
-        "pathParameters": None,
-    }
-
-    print(f"   🎯 Account: {account_id}")
-    print(f"   λ  Lambda: {function_name}")
-    print(f"   ⏳ Invoking...", end="", flush=True)
-
-    response = lambda_client.invoke(
-        FunctionName=function_name,
-        InvocationType='RequestResponse',
-        Payload=json.dumps(payload),
-    )
-
-    # Parse the response
-    response_payload = json.loads(response['Payload'].read().decode('utf-8'))
-
-    if response.get('FunctionError'):
-        print(f"\r   ❌ Lambda execution error!{' ' * 20}")
-        print(f"   Error: {response_payload}")
+    if not api_base_url or not jwt_secret_path:
+        print("   ❌ ISB_API_BASE_URL and ISB_JWT_SECRET_PATH environment variables must be set")
         return False
 
-    # Parse the Lambda response body
-    status_code = response_payload.get('statusCode', 0)
-    body_str = response_payload.get('body', '{}')
-    body = json.loads(body_str) if body_str else {}
+    # Fetch JWT secret from Secrets Manager (uses InnovationSandboxHub profile)
+    hub_session = boto3.Session(profile_name='NDX/InnovationSandboxHub')
+    print(f"   🔑 Fetching JWT secret...")
+    jwt_secret = fetch_jwt_secret(hub_session, jwt_secret_path)
 
-    if status_code == 201:
+    # Sign a proper HS256 JWT
+    token = sign_jwt(
+        {"user": {"email": "admin@innovation-sandbox.local", "roles": ["Admin"]}},
+        jwt_secret,
+    )
+
+    # POST to API Gateway
+    url = f"{api_base_url.rstrip('/')}/accounts"
+    body = json.dumps({"awsAccountId": account_id}).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+
+    print(f"   🎯 Account: {account_id}")
+    print(f"   🌐 API: {url}")
+    print(f"   ⏳ Registering...", end="", flush=True)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            status_code = response.status
+            response_body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        status_code = e.code
+        try:
+            response_body = json.loads(e.read().decode())
+        except Exception:
+            response_body = {}
+
+    if status_code == 201 and response_body.get("status") == "success":
         print(f"\r   ✅ Registered successfully!{' ' * 20}")
-        data = body.get('data', {})
+        data = response_body.get("data", {})
         print(f"   📄 Status: {data.get('status', 'unknown')}")
         return True
     else:
         print(f"\r   ❌ Registration failed (HTTP {status_code}){' ' * 20}")
-        print(f"   Response: {json.dumps(body, indent=2)}")
+        print(f"   Response: {json.dumps(response_body, indent=2)}")
         return False
 
 
