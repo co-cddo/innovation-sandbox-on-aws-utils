@@ -1,6 +1,6 @@
-# Innovation Sandbox Pool Account Creator
+# Innovation Sandbox on AWS — Utilities
 
-Automates the creation and registration of new pool accounts for AWS Innovation Sandbox.
+Utilities for managing AWS Innovation Sandbox pool accounts.
 
 ## Prerequisites
 
@@ -21,9 +21,13 @@ source venv/bin/activate
 pip install boto3
 ```
 
-## Usage
+---
 
-### Create a new pool account
+## create_sandbox_pool_account.py
+
+Automates the creation and registration of new pool accounts.
+
+### Usage
 
 ```bash
 source venv/bin/activate
@@ -74,11 +78,11 @@ The following constants can be modified in the script:
 | `check_interval` | `5` seconds | How often to check for OU move |
 | `max_wait` | `3600` seconds (1 hour) | Maximum time to wait for cleanup |
 
-## How it works
+### How it works
 
 The script bypasses CloudFront authentication by directly invoking the Innovation Sandbox Lambda function (`ISB-AccountsLambdaFunction-ndx`) with a mock JWT token. The Lambda only decodes (doesn't verify) the JWT, allowing direct API calls with Admin privileges.
 
-## Example output
+### Example output
 
 ```
 ============================================================
@@ -143,4 +147,120 @@ Account ID      Name                                     Status       Email
 ============================================================
    Account: pool-009 (123456789012)
    ⏱️  Total time: 12m 34s
+```
+
+---
+
+## clean_console_state.py
+
+Cleans up AWS Console state (recently visited services, favorites, dashboard, theme, locale) from recycled sandbox accounts.
+
+### Background
+
+When ISB recycles sandbox accounts using `aws-nuke`, the AWS Management Console state is not cleaned up. This is because console state is stored by the Console Control Service (CCS), an undocumented internal AWS service that stores per-principal user preference data outside the account's resource plane — `aws-nuke` has no visibility of it.
+
+This means new sandbox tenants see the previous user's recently visited services, favorited services, dashboard layout, and theme preferences.
+
+### What it cleans
+
+| Setting | Description |
+|---------|-------------|
+| `recentsConsole` | Recently visited services |
+| `recentsConsoleOptOutState` | Whether user opted out of recents tracking |
+| `favoritesConsole` | Favorited services |
+| `favoriteBarDisplay` | Whether favorites bar is shown |
+| `favoritesBarIconSize` | Icon size in favorites bar |
+| `defaultRegion` | Default region picker |
+| `locale` | Language preference |
+| `colorTheme` | Light/dark theme |
+
+It also resets the Console Home dashboard layout (`console-home-unified`).
+
+### Usage
+
+```bash
+source venv/bin/activate
+
+# Preview what would be cleaned (no changes made)
+python clean_console_state.py --dry-run
+
+# Clean all accounts in Available, CleanUp, and Quarantine OUs
+python clean_console_state.py
+
+# Clean only accounts in a specific OU
+python clean_console_state.py --ou Available
+
+# Clean a specific account
+python clean_console_state.py --account 680464296760
+
+# Show full settings detail
+python clean_console_state.py --dry-run --verbose
+```
+
+### How it works
+
+1. Discovers sandbox accounts by listing accounts in the ISB Organizations OUs (Available, CleanUp, Quarantine)
+2. For each account, discovers which ISB SSO permission sets are provisioned (`ndx_IsbUsersPS`, `ndx_IsbAdminsPS`, `ndx_IsbManagersPS`)
+3. Gets temporary credentials for each SSO role using the cached SSO access token
+4. Calls the CCS `UpdateCallerSettings` API with `deleteSettingNames` to clear all console preferences
+5. Calls the CCS `DeleteCallerDashboard` API to reset the dashboard layout
+6. Verifies the cleanup by reading settings back
+
+### Limitations
+
+CCS state is **per-caller** — keyed on the full assumed-role ARN including session name (e.g. `arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_ndx_IsbAdminsPS_abc123/user@example.com`). This script cleans state for the SSO principal running it. To clean state for other users who have accessed the console, it would need to be run with each user's SSO credentials.
+
+### Example output
+
+```
+============================================================
+🔑 STEP 1: AWS SSO Authentication
+============================================================
+  ✅ NDX/orgManagement - session valid
+  ✅ SSO access token found
+
+============================================================
+📋 STEP 2: Discover sandbox accounts from OU structure
+============================================================
+  Available: 4 account(s)
+  CleanUp: 0 account(s)
+  Quarantine: 8 account(s)
+
+📊 12 account(s) to process:
+
+Account ID      Name         OU
+---------------------------------------------
+023138541607    pool-010     Available
+107721656289    pool-011     Available
+221792773038    pool-008     Quarantine
+...
+
+============================================================
+🧹 STEP 3: Clean console state
+============================================================
+
+  ────────────────────────────────────────────────────────
+  📦 221792773038  pool-008  (Quarantine)
+  ────────────────────────────────────────────────────────
+
+     🔐 ndx_IsbAdminsPS
+        📊 3 recent services
+        🗑️  Deleted settings
+        🗑️  Deleted dashboard
+        ✅ Verified clean
+
+  ────────────────────────────────────────────────────────
+  📦 023138541607  pool-010  (Available)
+  ────────────────────────────────────────────────────────
+
+     🔐 ndx_IsbAdminsPS
+        ✅ Already clean
+
+============================================================
+📊 Summary
+============================================================
+  Accounts:       12
+  Cleaned:        8
+  Already clean:  4
+  Errors:         0
 ```
