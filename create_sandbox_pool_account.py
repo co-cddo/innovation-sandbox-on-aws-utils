@@ -242,6 +242,16 @@ def add_account_to_billing_view(session, account_id):
         return False
 
 
+def tag_account(session, account_id):
+    """Tag an account with do-not-separate."""
+    client = session.client('organizations')
+    client.tag_resource(
+        ResourceId=account_id,
+        Tags=[{'Key': 'do-not-separate', 'Value': ''}],
+    )
+    print(f"   ✅ Tagged with do-not-separate")
+
+
 def wait_for_ou_move(session, account_id, target_ou, check_interval=5, max_wait=3600):
     """Wait for an account to be moved to the target OU.
 
@@ -409,6 +419,11 @@ def main():
         print(f"{'='*60}")
         add_account_to_billing_view(session, account_id)
 
+        print(f"\n{'='*60}")
+        print(f"🏷️  Tag Account")
+        print(f"{'='*60}")
+        tag_account(session, account_id)
+
         account_name = f"(existing account {account_id})"
     else:
         # Normal mode - create a new account
@@ -460,6 +475,11 @@ def main():
         print(f"💰 STEP 4.5: Add to Billing View")
         print(f"{'='*60}")
         add_account_to_billing_view(session, account_id)
+
+        print(f"\n{'='*60}")
+        print(f"🏷️  STEP 4.6: Tag Account")
+        print(f"{'='*60}")
+        tag_account(session, account_id)
 
     print(f"\n{'='*60}")
     print(f"📝 STEP 5: Register with Innovation Sandbox")
