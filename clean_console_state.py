@@ -361,7 +361,8 @@ def get_sso_role_credentials_with_retry(sso_client, access_token, account_id, ro
             return creds
         if attempt < retries - 1:
             wait = 2 ** attempt  # 1, 2, 4, 8, 16s
-            print(f"        ⏳ Waiting {wait}s for assignment to propagate...", end="\r", flush=True)
+            total_waited = sum(2 ** i for i in range(attempt + 1))
+            print(f"        ⏳ Waiting for assignment to propagate ({total_waited}s)...")
             time.sleep(wait)
     return None
 
@@ -528,9 +529,9 @@ def main():
                     if args.dry_run:
                         print(f"        ℹ️  Would temporarily assign {role_name}")
                     else:
-                        print(f"        📌 Temporarily assigning...", end="", flush=True)
+                        print(f"        📌 Temporarily assigning...")
                         if create_account_assignment(sso_admin, account_id, ps_arn, user_id):
-                            print(f"\r        📌 Temporarily assigned            ")
+                            print(f"        📌 Assigned")
                             account_temp_assignments.append((ps_arn, role_name))
                             newly_assigned = True
                         else:
@@ -552,11 +553,10 @@ def main():
         finally:
             # Always remove temporary assignments for this account
             for ps_arn, ps_name in account_temp_assignments:
-                print(f"        🗑️  Removing {ps_name}...", end="", flush=True)
                 if delete_account_assignment(sso_admin, account_id, ps_arn, user_id):
-                    print(f"\r        🗑️  Removed {ps_name}               ")
+                    print(f"        🗑️  Removed {ps_name}")
                 else:
-                    print(f"\r        ⚠️  Failed to remove {ps_name} — clean up manually")
+                    print(f"        ⚠️  Failed to remove {ps_name} — clean up manually")
 
     # ── Summary ─────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
