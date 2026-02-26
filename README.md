@@ -7,8 +7,11 @@ Automates the creation and registration of new pool accounts for AWS Innovation 
 - Python 3.x
 - AWS CLI configured with SSO profiles:
   - `NDX/orgManagement` - Access to AWS Organizations
-  - `NDX/InnovationSandboxHub` - Access to Innovation Sandbox Lambda functions
+  - `NDX/InnovationSandboxHub` - Access to Secrets Manager (JWT signing secret)
 - Access to the Innovation Sandbox AWS Organization
+- Environment variables:
+  - `ISB_API_BASE_URL` - Innovation Sandbox API Gateway base URL
+  - `ISB_JWT_SECRET_PATH` - Secrets Manager path for JWT signing secret
 
 ## Setup
 
@@ -27,6 +30,8 @@ pip install boto3
 
 ```bash
 source venv/bin/activate
+export ISB_API_BASE_URL="https://your-isb-api-gateway-url"
+export ISB_JWT_SECRET_PATH="your/jwt-secret-path"
 python create_sandbox_pool_account.py
 ```
 
@@ -36,6 +41,8 @@ If account creation failed partway through, you can resume by providing the acco
 
 ```bash
 source venv/bin/activate
+export ISB_API_BASE_URL="https://your-isb-api-gateway-url"
+export ISB_JWT_SECRET_PATH="your/jwt-secret-path"
 python create_sandbox_pool_account.py 123456789012
 ```
 
@@ -53,7 +60,7 @@ The script performs the following steps:
 3. **🆕 Create new account** - Creates the next sequential pool account (e.g., `pool-009`)
 4. **📦 Move to Entry OU** - Moves the account to `ou-2laj-2by9v0sr` (Entry OU)
 5. **💰 Add to Billing View** - Adds the account to the custom billing view for cost tracking
-6. **📝 Register with Innovation Sandbox** - Invokes the ISB Lambda to register the account
+6. **📝 Register with Innovation Sandbox** - Calls the ISB API Gateway to register the account
 7. **🧹 Wait for cleanup** - Polls until the account is moved to `ou-2laj-oihxgbtr` (Ready OU)
 8. **🎉 Report** - Displays total time taken
 
@@ -63,6 +70,13 @@ The script performs the following steps:
 - Email addresses use the format: `ndx-try-provider+gds-ndx-try-aws-pool-NNN@dsit.gov.uk`
 
 ## Configuration
+
+The following environment variables are required:
+
+| Variable | Description |
+|----------|-------------|
+| `ISB_API_BASE_URL` | Innovation Sandbox API Gateway base URL |
+| `ISB_JWT_SECRET_PATH` | Secrets Manager path for JWT signing secret |
 
 The following constants can be modified in the script:
 
@@ -76,7 +90,7 @@ The following constants can be modified in the script:
 
 ## How it works
 
-The script bypasses CloudFront authentication by directly invoking the Innovation Sandbox Lambda function (`ISB-AccountsLambdaFunction-ndx`) with a mock JWT token. The Lambda only decodes (doesn't verify) the JWT, allowing direct API calls with Admin privileges.
+The script authenticates to the Innovation Sandbox API Gateway using a properly signed HS256 JWT. The JWT signing secret is fetched from AWS Secrets Manager using the `NDX/InnovationSandboxHub` SSO profile, then used to sign a token with Admin privileges for the `POST /accounts` API call.
 
 ## Example output
 
@@ -126,8 +140,9 @@ Account ID      Name                                     Status       Email
 ============================================================
 📝 STEP 5: Register with Innovation Sandbox
 ============================================================
+   🔑 Fetching JWT secret...
    🎯 Account: 123456789012
-   λ  Lambda: ISB-AccountsLambdaFunction-ndx
+   🌐 API: https://your-isb-api-gateway-url/accounts
    ✅ Registered successfully!
    📄 Status: CleanUp
 
