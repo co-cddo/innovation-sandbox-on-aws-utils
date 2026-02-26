@@ -26,10 +26,12 @@ the script needs to be run with credentials for each user's SSO session.
 """
 
 import argparse
+import base64
 import json
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
@@ -93,6 +95,193 @@ CCS_SETTINGS_TO_CHECK = [
 
 DASHBOARD_ID = "console-home-unified"
 
+# ISB Hub profile for querying lease data via Lambda
+ISB_HUB_PROFILE = "NDX/InnovationSandboxHub"
+LEASES_LAMBDA = "ISB-LeasesLambdaFunction-ndx"
+
+# Cache for tracking which accounts have already been cleaned
+CACHE_DIR = Path.home() / ".cache" / "clean-console-state"
+CACHE_FILE = CACHE_DIR / "cache.json"
+
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+
+def load_cache():
+    """Load the cleaning cache from disk."""
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_cache(cache):
+    """Save the cleaning cache to disk."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+
+
+def clear_cache():
+    """Remove the cache file."""
+    if CACHE_FILE.exists():
+        CACHE_FILE.unlink()
+        print(f"  🗑️  Cache cleared: {CACHE_FILE}")
+    else:
+        print(f"  ℹ️  No cache file found: {CACHE_FILE}")
+
+
+def update_cache(cache, account_id, permission_sets):
+    """Mark an account as cleaned in the cache."""
+    now = datetime.now(timezone.utc).isoformat()
+    existing = cache.get(account_id, {})
+    existing_psets = set(existing.get("permission_sets", []))
+    existing_psets.update(permission_sets)
+    cache[account_id] = {
+        "cleaned_at": now,
+        "permission_sets": sorted(existing_psets),
+    }
+
+
+# ── ISB Lease Query ──────────────────────────────────────────────────────────
+
+def create_mock_jwt():
+    """Create a mock JWT token for direct Lambda invocation.
+
+    The Lambda only decodes the JWT (doesn't verify signature), so we can
+    create an unsigned token with the required user structure.
+    """
+    header = {"alg": "none", "typ": "JWT"}
+    payload = {
+        "user": {
+            "email": "admin@innovation-sandbox.local",
+            "roles": ["Admin"],
+        }
+    }
+
+    def b64_encode(data):
+        return base64.urlsafe_b64encode(
+            json.dumps(data).encode()
+        ).rstrip(b'=').decode()
+
+    return f"{b64_encode(header)}.{b64_encode(payload)}."
+
+
+def get_isb_leases(verbose=False):
+    """Query the ISB leases Lambda to get all leases."""
+    hub_session = boto3.Session(profile_name=ISB_HUB_PROFILE)
+    lambda_client = hub_session.client('lambda')
+    mock_token = create_mock_jwt()
+
+    event = {
+        "httpMethod": "GET",
+        "path": "/leases",
+        "headers": {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {mock_token}",
+        },
+        "requestContext": {},
+        "queryStringParameters": None,
+        "pathParameters": None,
+    }
+
+    response = lambda_client.invoke(
+        FunctionName=LEASES_LAMBDA,
+        InvocationType='RequestResponse',
+        Payload=json.dumps(event),
+    )
+
+    response_payload = json.loads(response['Payload'].read().decode('utf-8'))
+
+    if response.get('FunctionError'):
+        raise RuntimeError(f"Lambda error: {response_payload}")
+
+    status_code = response_payload.get('statusCode', 0)
+    body_str = response_payload.get('body', '{}')
+    body = json.loads(body_str) if body_str else {}
+
+    if verbose:
+        print(f"  🔍 Leases API response (HTTP {status_code}):")
+        print(f"     {json.dumps(body, indent=6)[:2000]}")
+
+    if status_code != 200:
+        raise RuntimeError(f"ISB leases API returned HTTP {status_code}: {body}")
+
+    return body
+
+
+def get_last_lease_times(body):
+    """Return dict of account_id -> most recent lease creation time (ISO string).
+
+    Handles various ISB response shapes:
+      - {"data": [{"accountId": ..., "createdDate": ...}, ...]}
+      - {"data": {"leases": [...]}}
+      - [{"accountId": ..., "createdDate": ...}, ...]
+    """
+    # Extract the lease list from whichever shape the API returns
+    leases = []
+    if isinstance(body, list):
+        leases = body
+    elif isinstance(body, dict):
+        data = body.get('data', body)
+        if isinstance(data, list):
+            leases = data
+        elif isinstance(data, dict):
+            # Try common nested keys
+            for key in ('leases', 'items', 'results'):
+                if isinstance(data.get(key), list):
+                    leases = data[key]
+                    break
+            else:
+                # data dict might be a single lease or keyed by account
+                leases = list(data.values()) if data else []
+
+    last_times = {}
+    for lease in leases:
+        if not isinstance(lease, dict):
+            continue
+        account_id = lease.get('accountId') or lease.get('awsAccountId', '')
+        lease_date = (
+            lease.get('createdDate')
+            or lease.get('startDate')
+            or lease.get('lastModifiedDate', '')
+        )
+        if not account_id or not lease_date:
+            continue
+
+        if account_id not in last_times or lease_date > last_times[account_id]:
+            last_times[account_id] = lease_date
+
+    return last_times
+
+
+def account_needs_cleaning(account_id, cache, last_lease_times, permission_sets_requested):
+    """Check if an account needs cleaning based on cache and lease data.
+
+    Returns (needs_cleaning: bool, reason: str)
+    """
+    cached = cache.get(account_id)
+    if not cached:
+        return True, "not in cache"
+
+    cleaned_at = cached.get("cleaned_at", "")
+    cached_psets = set(cached.get("permission_sets", []))
+
+    # If we're cleaning permission sets not previously cached, need to clean
+    if not set(permission_sets_requested).issubset(cached_psets):
+        new_psets = set(permission_sets_requested) - cached_psets
+        return True, f"new permission sets: {', '.join(sorted(new_psets))}"
+
+    # If there's a lease issued after our last clean, need to clean
+    last_lease = last_lease_times.get(account_id)
+    if last_lease and last_lease > cleaned_at:
+        return True, f"lease since last clean ({last_lease[:19]})"
+
+    if not last_lease:
+        return False, f"no leases found, cleaned {cleaned_at[:19]}"
+
+    return False, f"cleaned {cleaned_at[:19]}, last lease {last_lease[:19]}"
+
 
 # ── SSO Authentication ───────────────────────────────────────────────────────
 
@@ -125,8 +314,6 @@ def ensure_sso_login(profile_name):
 
 def find_sso_access_token():
     """Find a valid SSO access token from the AWS CLI cache."""
-    from datetime import datetime, timezone
-
     cache_dir = Path.home() / ".aws" / "sso" / "cache"
     if not cache_dir.exists():
         return None
@@ -442,7 +629,15 @@ def main():
                         help="Clean all ISB permission sets (default: only ndx_IsbUsersPS)")
     parser.add_argument("--dry-run", action="store_true", help="Check state without making changes")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show full settings detail")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Clear the cleaning cache and exit")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Ignore the cache for this run (clean all accounts)")
     args = parser.parse_args()
+
+    if args.clear_cache:
+        clear_cache()
+        sys.exit(0)
 
     target_ous = {name: TARGET_OUS[name] for name in args.ou} if args.ou else TARGET_OUS
     if args.all_roles:
@@ -450,11 +645,14 @@ def main():
     else:
         permission_sets = {k: ALL_PERMISSION_SETS[k] for k in DEFAULT_PERMISSION_SETS}
 
+    use_cache = not args.no_cache
+
     # ── Step 1: SSO Authentication ──────────────────────────────────────────
     print("=" * 60)
     print("🔑 STEP 1: AWS SSO Authentication")
     print("=" * 60)
     ensure_sso_login(ORG_PROFILE)
+    ensure_sso_login(ISB_HUB_PROFILE)
 
     sso_token = find_sso_access_token()
     if not sso_token:
@@ -494,11 +692,58 @@ def main():
         print("  ℹ️  No accounts found in target OUs")
         sys.exit(0)
 
-    print(f"\n📊 {len(accounts)} account(s) to process:\n")
-    print(f"{'Account ID':<15} {'Name':<12} {'OU'}")
-    print("-" * 45)
+    print(f"\n📊 {len(accounts)} account(s) found")
+
+    # ── Step 2.5: Query lease data and check cache ─────────────────────────
+    print(f"\n{'='*60}")
+    print("📅 STEP 2.5: Check lease history and cache")
+    print("=" * 60)
+
+    cache = load_cache() if use_cache else {}
+    last_lease_times = {}
+    pset_names = list(permission_sets.keys())
+
+    try:
+        print("  📡 Querying ISB lease data...")
+        leases_body = get_isb_leases(verbose=args.verbose)
+        last_lease_times = get_last_lease_times(leases_body)
+        print(f"  ✅ Found lease data for {len(last_lease_times)} account(s)")
+    except Exception as e:
+        print(f"  ⚠️  Could not query leases: {e}")
+        print(f"  ℹ️  Proceeding without lease data (will clean all accounts)")
+
+    if use_cache and cache:
+        print(f"  📁 Cache: {len(cache)} account(s) from {CACHE_FILE}")
+    elif use_cache:
+        print(f"  📁 Cache: empty")
+    else:
+        print(f"  📁 Cache: disabled (--no-cache)")
+
+    # Determine which accounts need cleaning
+    accounts_to_clean = {}
+    total_skipped = 0
+    print(f"\n{'Account ID':<15} {'Name':<12} {'OU':<12} {'Status'}")
+    print("-" * 65)
     for acct_id, (name, ou_name) in sorted(accounts.items()):
-        print(f"{acct_id:<15} {name:<12} {ou_name}")
+        if use_cache:
+            needs_cleaning, reason = account_needs_cleaning(
+                acct_id, cache, last_lease_times, pset_names
+            )
+        else:
+            needs_cleaning, reason = True, "cache disabled"
+
+        if needs_cleaning:
+            accounts_to_clean[acct_id] = (name, ou_name)
+            print(f"{acct_id:<15} {name:<12} {ou_name:<12} 🔄 {reason}")
+        else:
+            total_skipped += 1
+            print(f"{acct_id:<15} {name:<12} {ou_name:<12} ⏭️  skip: {reason}")
+
+    if not accounts_to_clean:
+        print(f"\n  ✅ All {len(accounts)} account(s) already clean — nothing to do")
+        sys.exit(0)
+
+    print(f"\n📊 {len(accounts_to_clean)} to clean, {total_skipped} skipped")
 
     # ── Step 3: Clean console state ─────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -509,13 +754,14 @@ def main():
     total_already_clean = 0
     total_errors = 0
 
-    for account_id, (name, ou_name) in sorted(accounts.items()):
+    for account_id, (name, ou_name) in sorted(accounts_to_clean.items()):
         print(f"\n  {'─'*56}")
         print(f"  📦 {account_id}  {name}  ({ou_name})")
         print(f"  {'─'*56}")
 
         # Track temp assignments for this account so we always clean up
         account_temp_assignments = []
+        account_had_error = False
 
         try:
             for role_name, ps_arn in permission_sets.items():
@@ -536,6 +782,7 @@ def main():
                             newly_assigned = True
                         else:
                             total_errors += 1
+                            account_had_error = True
                             continue
 
                 result = clean_role(sso_client, sso_token, account_id, role_name, args.dry_run, args.verbose, newly_assigned)
@@ -545,10 +792,12 @@ def main():
                     total_already_clean += 1
                 else:
                     total_errors += 1
+                    account_had_error = True
 
         except Exception as e:
             print(f"\n     ❌ Unexpected error: {e}")
             total_errors += 1
+            account_had_error = True
 
         finally:
             # Always remove temporary assignments for this account
@@ -558,6 +807,11 @@ def main():
                 else:
                     print(f"        ⚠️  Failed to remove {ps_name} — clean up manually")
 
+            # Update cache if account was processed without errors
+            if not account_had_error and not args.dry_run:
+                update_cache(cache, account_id, pset_names)
+                save_cache(cache)
+
     # ── Summary ─────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     if args.dry_run:
@@ -566,9 +820,12 @@ def main():
         print("📊 Summary")
     print("=" * 60)
     print(f"  Accounts:       {len(accounts)}")
+    print(f"  Skipped (cache):{total_skipped:>3}")
     print(f"  Cleaned:        {total_cleaned}")
     print(f"  Already clean:  {total_already_clean}")
     print(f"  Errors:         {total_errors}")
+    if use_cache:
+        print(f"  Cache:          {CACHE_FILE}")
 
     if total_errors > 0:
         sys.exit(1)

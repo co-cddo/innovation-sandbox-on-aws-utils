@@ -151,6 +151,75 @@ Account ID      Name                                     Status       Email
 
 ---
 
+## create_user.py
+
+Creates a user in AWS Identity Center and adds them to the `ndx_IsbUsersGroup` group.
+
+### Usage
+
+```bash
+source venv/bin/activate
+
+# Create a user
+python create_user.py --firstname=John --lastname="O'Donnel" --email="foo@bar.com"
+
+# Create a user with a custom display name
+python create_user.py --firstname=Jane --lastname=Doe --email="jane@example.com" --displayname="Dr Jane Doe"
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--firstname` | Yes | User's first name |
+| `--lastname` | Yes | User's last name |
+| `--email` | Yes | User's email address (also used as username) |
+| `--displayname` | No | Display name (defaults to `firstname lastname`) |
+
+### What it does
+
+1. **🔑 SSO Authentication** — Validates existing session, prompts for login if needed
+2. **📋 Resolve Identity Store** — Discovers the Identity Store ID and locates the `ndx_IsbUsersGroup` group
+3. **👤 Create user** — Creates the user in Identity Center (skips if they already exist)
+4. **👥 Add to group** — Adds the user to `ndx_IsbUsersGroup` (skips if already a member)
+
+### Example output
+
+```
+============================================================
+🔑 STEP 1: AWS SSO Authentication
+============================================================
+  ✅ NDX/orgManagement - session valid
+
+============================================================
+📋 STEP 2: Resolve Identity Store
+============================================================
+   Identity Store: d-9267e1e371
+   Group: ndx_IsbUsersGroup (a8412370-2051-702a-84d1-6688eeee30fa)
+
+============================================================
+👤 STEP 3: Create user
+============================================================
+   First name:    Chris
+   Last name:     Nesbitt-Smith
+   Email:         chris.nesbitt-smith@dsit.gov.uk
+   Display name:  Chris Nesbitt-Smith
+
+   ✅ User created: b82193a0-f051-70ea-dc76-b1fefef4114b
+
+============================================================
+👥 STEP 4: Add to ndx_IsbUsersGroup
+============================================================
+   ✅ Added to group
+
+============================================================
+🎉 COMPLETE
+============================================================
+   User:    Chris Nesbitt-Smith (chris.nesbitt-smith@dsit.gov.uk)
+   User ID: b82193a0-f051-70ea-dc76-b1fefef4114b
+   Group:   ndx_IsbUsersGroup
+```
+
+---
+
 ## clean_console_state.py
 
 Cleans up AWS Console state (recently visited services, favorites, dashboard, theme, locale) from recycled sandbox accounts.
