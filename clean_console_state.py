@@ -97,6 +97,8 @@ DASHBOARD_ID = "console-home-unified"
 
 # ISB Hub profile for querying lease data via Lambda
 ISB_HUB_PROFILE = "NDX/InnovationSandboxHub"
+ISB_API_BASE_URL = "https://1ewlxhaey6.execute-api.us-west-2.amazonaws.com/prod/"
+ISB_JWT_SECRET_PATH = "/InnovationSandbox/ndx/Auth/JwtSecret"
 LEASES_LAMBDA = "ISB-LeasesLambdaFunction-ndx"
 
 # Cache for tracking which accounts have already been cleaned
