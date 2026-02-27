@@ -235,6 +235,172 @@ python create_user.py --firstname=Jane --lastname=Doe --email="jane@example.com"
 
 ---
 
+## assign_lease.py
+
+Assigns a lease from an Innovation Sandbox lease template to a user. Optionally configures local AWS SSO profiles for the sandbox account.
+
+### Usage
+
+```bash
+source venv/bin/activate
+
+# Assign a lease to yourself (also configures ~/.aws/config SSO profiles)
+python assign_lease.py council-chatbot
+
+# Assign a lease to another user
+python assign_lease.py --user=chris@example.com council-chatbot
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `template` | Yes | Lease template name (case-insensitive) |
+| `--user` | No | Email of user to assign the lease to (default: current SSO user) |
+
+### What it does
+
+1. **🔑 SSO Authentication** — Validates sessions for `NDX/orgManagement` and `NDX/InnovationSandboxHub`
+2. **👤 Resolve user** — Gets email from STS identity (or uses `--user` argument)
+3. **🔑 Sign JWT** — Fetches secret from Secrets Manager and signs an HS256 admin token
+4. **📋 Resolve lease template** — Lists all templates via `GET /leaseTemplates`, finds the matching one by name
+5. **📝 Create lease** — `POST /leases` with the template UUID and user email
+6. **🔧 Configure SSO profiles** (self-service only) — Creates/updates `NDX/SandboxUser` and `NDX/SandboxAdmin` profiles in `~/.aws/config`, then runs `aws sso login` for each
+7. **🎉 Summary** — Displays user, template, account ID, and lease UUID
+
+### SSO profiles created
+
+When running in self-service mode (no `--user` flag) and an account ID is returned, the script creates two profiles in `~/.aws/config`:
+
+- `NDX/SandboxUser` — uses `ndx_IsbUsersPS` role
+- `NDX/SandboxAdmin` — uses `ndx_IsbAdminsPS` role
+
+### Example output
+
+```
+============================================================
+🔑 STEP 1: AWS SSO Authentication
+============================================================
+  ✅ NDX/orgManagement - session valid
+  ✅ NDX/InnovationSandboxHub - session valid
+
+============================================================
+👤 STEP 2: Resolve user
+============================================================
+  📧 chris@example.com (self)
+
+============================================================
+🔑 STEP 3: Sign JWT
+============================================================
+  🔑 Fetching JWT secret...
+  ✅ JWT signed
+
+============================================================
+📋 STEP 4: Resolve lease template
+============================================================
+  🔍 Looking up 'council-chatbot'...
+  ✅ Found: council-chatbot
+     UUID: abc123-def456-...
+
+============================================================
+📝 STEP 5: Create lease
+============================================================
+  ✅ Lease created
+     UUID: lease-uuid-123...
+     Status: Provisioning
+     Account: 123456789012
+
+============================================================
+🔧 STEP 6: Configure AWS SSO profiles
+============================================================
+  ✅ Updated ~/.aws/config
+     - NDX/SandboxUser
+     - NDX/SandboxAdmin
+
+============================================================
+🎉 COMPLETE
+============================================================
+  User:     chris@example.com
+  Template: council-chatbot
+  Account:  123456789012
+  Lease:    lease-uuid-123...
+```
+
+---
+
+## terminate_lease.py
+
+Terminates all active Innovation Sandbox leases for a user.
+
+### Usage
+
+```bash
+source venv/bin/activate
+
+# Terminate all your active leases
+python terminate_lease.py
+
+# Terminate all active leases for another user
+python terminate_lease.py --user=chris@example.com
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--user` | No | Email of user whose leases to terminate (default: current SSO user) |
+
+### What it does
+
+1. **🔑 SSO Authentication** — Validates sessions for `NDX/orgManagement` and `NDX/InnovationSandboxHub`
+2. **👤 Resolve user** — Gets email from STS identity (or uses `--user` argument)
+3. **🔑 Sign JWT** — Fetches secret from Secrets Manager and signs an HS256 admin token
+4. **📋 Fetch active leases** — `GET /leases?userEmail=...`, filters for active statuses (`Active`, `Frozen`, `Provisioning`, `PendingApproval`)
+5. **🗑️ Terminate each** — `POST /leases/{uuid}/terminate` for each active lease
+6. **📊 Summary** — Count of terminated vs failed
+
+### Example output
+
+```
+============================================================
+🔑 STEP 1: AWS SSO Authentication
+============================================================
+  ✅ NDX/orgManagement - session valid
+  ✅ NDX/InnovationSandboxHub - session valid
+
+============================================================
+👤 STEP 2: Resolve user
+============================================================
+  📧 chris@example.com (self)
+
+============================================================
+🔑 STEP 3: Sign JWT
+============================================================
+  🔑 Fetching JWT secret...
+  ✅ JWT signed
+
+============================================================
+📋 STEP 4: Fetch active leases
+============================================================
+  🔍 Querying leases for chris@example.com...
+
+  📊 Found 2 active lease(s):
+
+  UUID                                   Account        Template                       Status           Start Date
+  -------------------------------------- -------------- ------------------------------ ---------------- ------------------------
+  abc123-...                             123456789012   council-chatbot                Active           2025-01-15T10:30:00Z
+
+============================================================
+🗑️  STEP 5: Terminate leases
+============================================================
+  ✅ Terminated abc123-... (council-chatbot, 123456789012)
+
+============================================================
+📊 Summary
+============================================================
+  User:       chris@example.com
+  Terminated: 2
+  Failed:     0
+```
+
+---
+
 ## clean_console_state.py
 
 Cleans up AWS Console state (recently visited services, favorites, dashboard, theme, locale) from recycled sandbox accounts.
