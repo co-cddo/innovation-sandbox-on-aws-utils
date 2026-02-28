@@ -213,7 +213,7 @@ def get_active_leases(token, user_email, verbose=False):
 
 def terminate_lease(token, lease_id):
     """Terminate a single lease by leaseId (Base64-encoded)."""
-    encoded_id = urllib.request.quote(lease_id, safe="")
+    encoded_id = urllib.request.quote(lease_id, safe="+=")
     status, body = make_isb_api_request("POST", f"/leases/{encoded_id}/terminate", token)
     return status == 200, status, body
 

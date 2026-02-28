@@ -36,6 +36,14 @@ ISB_JWT_SECRET_PATH = "/InnovationSandbox/ndx/Auth/JwtSecret"
 ACTIVE_STATUSES = {"Active", "Frozen", "Provisioning", "PendingApproval"}
 
 
+def format_duration(seconds):
+    """Format seconds into a human-readable duration."""
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 # ── SSO Authentication ───────────────────────────────────────────────────────
 
 def check_sso_session(profile_name):
@@ -225,7 +233,7 @@ def update_aws_config_profiles(account_id):
             "sso_session": profile_name,
             "sso_account_id": account_id,
             "sso_role_name": role_name,
-            "region": SSO_REGION,
+            "region": "us-east-1",
         }
 
         config[sso_section] = {
@@ -405,6 +413,12 @@ def main():
     # Response is wrapped: {"status": "success", "data": {...lease...}}
     lease = response.get("data", response)
     lease_uuid = lease.get("uuid", "unknown")
+    lease_id = lease.get("leaseId", "")
+    if not lease_id:
+        # Construct leaseId (base64-encoded composite key used by the API)
+        lease_id = base64.b64encode(
+            json.dumps({"userEmail": user_email, "uuid": lease_uuid}, separators=(',', ':')).encode()
+        ).decode()
     account_id = lease.get("awsAccountId", "")
     lease_status = lease.get("status", "unknown")
 
@@ -413,6 +427,48 @@ def main():
     print(f"     Status: {lease_status}")
     if account_id:
         print(f"     Account: {account_id}")
+
+    # ── Step 5b: Wait for provisioning if needed ─────────────────────────
+    if lease_status == "Provisioning":
+        print(f"\n{'='*60}")
+        print("⏳ STEP 5b: Wait for provisioning")
+        print("=" * 60)
+
+        start_wait = time.time()
+        check_interval = 5
+        max_wait = 1800  # 30 minutes
+
+        while True:
+            elapsed = time.time() - start_wait
+            if elapsed > max_wait:
+                print(f"\r  ❌ Timeout after {format_duration(elapsed)}{' ' * 30}")
+                sys.exit(1)
+
+            time.sleep(check_interval)
+            elapsed = time.time() - start_wait
+
+            poll_status, poll_response = make_isb_api_request(
+                "GET", f"/leases/{lease_id}", token,
+            )
+
+            if poll_status != 200:
+                print(f"\r  ⏳ Provisioning... | Elapsed: {format_duration(elapsed)} (poll error: HTTP {poll_status})", end="", flush=True)
+                continue
+
+            poll_lease = poll_response.get("data", poll_response)
+            lease_status = poll_lease.get("status", "unknown")
+            account_id = poll_lease.get("awsAccountId", "") or account_id
+
+            if lease_status == "Provisioning":
+                print(f"\r  ⏳ Provisioning... | Elapsed: {format_duration(elapsed)}", end="", flush=True)
+            elif lease_status == "Active":
+                print(f"\r  ✅ Provisioning complete after {format_duration(elapsed)}{' ' * 20}")
+                if account_id:
+                    print(f"     Account: {account_id}")
+                break
+            else:
+                print(f"\r  ⚠️  Unexpected status: {lease_status} after {format_duration(elapsed)}{' ' * 20}")
+                break
 
     # ── Step 6: Configure SSO profiles (self-service only) ───────────────
     if self_service and account_id:
