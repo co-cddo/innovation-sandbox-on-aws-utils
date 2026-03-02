@@ -287,31 +287,20 @@ def account_needs_cleaning(account_id, cache, last_lease_times, permission_sets_
 
 # ── SSO Authentication ───────────────────────────────────────────────────────
 
-def check_sso_session(profile_name):
-    """Check if SSO session is valid for the given profile."""
-    try:
-        session = boto3.Session(profile_name=profile_name)
-        sts = session.client("sts")
-        sts.get_caller_identity()
-        return True
-    except Exception:
-        return False
-
-
 def ensure_sso_login(profile_name):
-    """Ensure SSO login for the given profile, only prompting if needed."""
-    if check_sso_session(profile_name):
-        print(f"  ✅ {profile_name} - session valid")
+    """Ensure SSO login, only prompting if the cached token is expired or missing."""
+    if find_sso_access_token():
+        print(f"  ✅ SSO session valid")
         return
 
-    print(f"  🔐 {profile_name} - logging in...")
+    print(f"  🔐 SSO token expired, logging in...")
     result = subprocess.run(
         ["aws", "sso", "login", "--profile", profile_name],
         capture_output=False,
     )
     if result.returncode != 0:
         raise RuntimeError(f"❌ SSO login failed for profile {profile_name}")
-    print(f"  ✅ {profile_name} - login successful")
+    print(f"  ✅ SSO login successful")
 
 
 def find_sso_access_token():
