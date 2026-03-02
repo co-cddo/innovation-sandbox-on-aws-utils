@@ -22,6 +22,9 @@ import time
 import urllib.error
 import urllib.request
 
+from datetime import datetime, timezone
+from pathlib import Path
+
 import boto3
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -46,31 +49,98 @@ def format_duration(seconds):
 
 # ── SSO Authentication ───────────────────────────────────────────────────────
 
-def check_sso_session(profile_name):
-    """Check if SSO session is valid for the given profile."""
-    try:
-        session = boto3.Session(profile_name=profile_name)
-        sts = session.client("sts")
-        sts.get_caller_identity()
-        return True
-    except Exception:
+def check_sso_token_valid():
+    """Check if a valid (non-expired) SSO access token exists in the local cache."""
+    cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not cache_dir.exists():
         return False
+    for f in cache_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("startUrl") != SSO_START_URL:
+            continue
+        if "accessToken" not in data or "expiresAt" not in data:
+            continue
+        expiry_str = data["expiresAt"].replace("Z", "+00:00")
+        try:
+            expiry = datetime.fromisoformat(expiry_str)
+        except ValueError:
+            continue
+        if expiry > datetime.now(timezone.utc):
+            return True
+    return False
 
 
 def ensure_sso_login(profile_name):
-    """Ensure SSO login for the given profile, only prompting if needed."""
-    if check_sso_session(profile_name):
-        print(f"  ✅ {profile_name} - session valid")
+    """Ensure SSO login, only prompting if the cached token is expired or missing."""
+    if check_sso_token_valid():
+        print(f"  ✅ SSO session valid")
         return
 
-    print(f"  🔐 {profile_name} - logging in...")
+    print(f"  🔐 SSO token expired, logging in...")
     result = subprocess.run(
         ["aws", "sso", "login", "--profile", profile_name],
         capture_output=False,
     )
     if result.returncode != 0:
         raise RuntimeError(f"❌ SSO login failed for profile {profile_name}")
-    print(f"  ✅ {profile_name} - login successful")
+    print(f"  ✅ SSO login successful")
+
+
+# ── SSO role readiness ────────────────────────────────────────────────────────
+
+def find_sso_access_token():
+    """Find a valid SSO access token from the AWS CLI cache."""
+    cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not cache_dir.exists():
+        return None
+    for f in cache_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("startUrl") != SSO_START_URL:
+            continue
+        if "accessToken" not in data or "expiresAt" not in data:
+            continue
+        expiry_str = data["expiresAt"].replace("Z", "+00:00")
+        try:
+            expiry = datetime.fromisoformat(expiry_str)
+        except ValueError:
+            continue
+        if expiry > datetime.now(timezone.utc):
+            return data["accessToken"]
+    return None
+
+
+def wait_for_sso_role(account_id, role_name="ndx_IsbUsersPS", max_wait=30, interval=3):
+    """Poll until the SSO role is accessible on the account, or timeout."""
+    access_token = find_sso_access_token()
+    if not access_token:
+        print(f"  ⚠️  No SSO access token found, skipping role check")
+        return False
+
+    sso = boto3.client("sso", region_name=SSO_REGION)
+    start = time.time()
+
+    while True:
+        elapsed = time.time() - start
+        try:
+            sso.get_role_credentials(
+                accountId=account_id,
+                roleName=role_name,
+                accessToken=access_token,
+            )
+            print(f"\r  ✅ Role {role_name} ready on {account_id}{' ' * 20}")
+            return True
+        except Exception:
+            if elapsed >= max_wait:
+                print(f"\r  ⚠️  Role not available after {int(elapsed)}s, skipping console{' ' * 20}")
+                return False
+            print(f"\r  ⏳ Waiting for role assignment to propagate... ({int(elapsed)}s)", end="", flush=True)
+            time.sleep(interval)
 
 
 # ── JWT ──────────────────────────────────────────────────────────────────────
@@ -252,7 +322,10 @@ def update_aws_config_profiles(account_id):
 
 
 def sso_login_sandbox_profiles():
-    """Run aws sso login for the sandbox profiles."""
+    """Run aws sso login for the sandbox profiles if needed."""
+    if check_sso_token_valid():
+        print(f"  ✅ SSO session valid")
+        return
     for profile_name in ("NDX/SandboxUser", "NDX/SandboxAdmin"):
         print(f"  🔐 {profile_name} - logging in...")
         result = subprocess.run(
@@ -484,11 +557,16 @@ def main():
 
         sso_login_sandbox_profiles()
 
-        # Open console in browser
-        import webbrowser
-        console_url = f"{SSO_START_URL}#/console?account_id={account_id}&role_name=ndx_IsbUsersPS"
-        print(f"\n  🌐 Opening console: {console_url}")
-        webbrowser.open(console_url)
+        # Wait for role assignment to propagate before opening console
+        print(f"\n{'='*60}")
+        print("⏳ STEP 8: Wait for role assignment")
+        print("=" * 60)
+
+        if wait_for_sso_role(account_id):
+            import webbrowser
+            console_url = f"{SSO_START_URL}#/console?account_id={account_id}&role_name=ndx_IsbUsersPS"
+            print(f"\n  🌐 Opening console: {console_url}")
+            webbrowser.open(console_url)
 
     # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -499,6 +577,10 @@ def main():
     if account_id:
         print(f"  Account:  {account_id}")
     print(f"  Lease:    {lease_uuid}")
+    if self_service and account_id:
+        print(f"\n  AWS CLI profiles:")
+        print(f"    aws --profile NDX/SandboxUser  ...   # {account_id} (ndx_IsbUsersPS)")
+        print(f"    aws --profile NDX/SandboxAdmin ...   # {account_id} (ndx_IsbAdminsPS)")
 
 
 if __name__ == "__main__":

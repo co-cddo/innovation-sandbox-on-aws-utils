@@ -25,11 +25,26 @@ import time
 import urllib.error
 import urllib.request
 
+from datetime import datetime, timezone
+from pathlib import Path
+
 import boto3
+
+SSO_START_URL = "https://d-9267e1e371.awsapps.com/start"
 
 # Target OU where Innovation Sandbox moves accounts after cleanup
 SANDBOX_READY_OU = "ou-2laj-oihxgbtr"
 ENTRY_OU = "ou-2laj-2by9v0sr"
+
+POOL_OUS = {
+    "Active":     "ou-2laj-sre4rnjs",
+    "Available":  "ou-2laj-oihxgbtr",
+    "CleanUp":    "ou-2laj-x3o8lbk8",
+    "Entry":      "ou-2laj-2by9v0sr",
+    "Exit":       "ou-2laj-s1t02mrz",
+    "Frozen":     "ou-2laj-jpffue7g",
+    "Quarantine": "ou-2laj-mmagoake",
+}
 ROOT_ID = None  # Will be populated at runtime
 _root_id_lock = threading.Lock()
 
@@ -43,31 +58,44 @@ BILLING_VIEW_ARN = "arn:aws:billing::955063685555:billingview/custom-466e2613-e0
 _billing_lock = threading.Lock()
 
 
-def check_sso_session(profile_name):
-    """Check if SSO session is valid for the given profile."""
-    try:
-        session = boto3.Session(profile_name=profile_name)
-        sts = session.client('sts')
-        sts.get_caller_identity()
-        return True
-    except Exception:
+def check_sso_token_valid():
+    """Check if a valid (non-expired) SSO access token exists in the local cache."""
+    cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not cache_dir.exists():
         return False
+    for f in cache_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("startUrl") != SSO_START_URL:
+            continue
+        if "accessToken" not in data or "expiresAt" not in data:
+            continue
+        expiry_str = data["expiresAt"].replace("Z", "+00:00")
+        try:
+            expiry = datetime.fromisoformat(expiry_str)
+        except ValueError:
+            continue
+        if expiry > datetime.now(timezone.utc):
+            return True
+    return False
 
 
 def ensure_sso_login(profile_name):
-    """Ensure SSO login for the given profile, only prompting if needed."""
-    if check_sso_session(profile_name):
-        print(f"  ✅ {profile_name} - session valid")
+    """Ensure SSO login, only prompting if the cached token is expired or missing."""
+    if check_sso_token_valid():
+        print(f"  ✅ SSO session valid")
         return
 
-    print(f"  🔐 {profile_name} - logging in...")
+    print(f"  🔐 SSO token expired, logging in...")
     result = subprocess.run(
         ["aws", "sso", "login", "--profile", profile_name],
         capture_output=False,
     )
     if result.returncode != 0:
         raise RuntimeError(f"❌ SSO login failed for profile {profile_name}")
-    print(f"  ✅ {profile_name} - login successful")
+    print(f"  ✅ SSO login successful")
 
 
 def sign_jwt(payload, secret, expires_in_seconds=3600):
@@ -411,6 +439,20 @@ def register_with_innovation_sandbox(account_id, api_base_url, jwt_secret, label
         return False
 
 
+def print_pool_summary(session):
+    """Print account counts for each OU in the sandbox pool."""
+    client = session.client('organizations')
+    total = 0
+    for name, ou_id in POOL_OUS.items():
+        count = 0
+        paginator = client.get_paginator('list_accounts_for_parent')
+        for page in paginator.paginate(ParentId=ou_id):
+            count += len(page['Accounts'])
+        total += count
+        print(f"   {name:<12} {count:>3}")
+    print(f"   {'Total':<12} {total:>3}")
+
+
 def deploy_scps():
     """Dispatch the SCP Terraform workflow and wait for completion.
 
@@ -713,6 +755,11 @@ def main():
         print(f"   Account: {account_id}")
         print(f"   ⏱️  Total time: {format_duration(total_duration)}")
 
+        print(f"\n{'='*60}")
+        print(f"📊 Pool account summary")
+        print(f"{'='*60}")
+        print_pool_summary(session)
+
     else:
         # Normal mode - create new account(s)
         print(f"\n{'='*60}")
@@ -809,6 +856,11 @@ def main():
                 print(f", {failed} failed", end="")
             print()
         print(f"   ⏱️  Total time: {format_duration(total_duration)}")
+
+        print(f"\n{'='*60}")
+        print(f"📊 Pool account summary")
+        print(f"{'='*60}")
+        print_pool_summary(session)
 
 
 if __name__ == '__main__':

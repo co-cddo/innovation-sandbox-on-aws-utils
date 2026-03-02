@@ -6,43 +6,60 @@ Uses the NDX/orgManagement profile for Identity Store API access.
 """
 
 import argparse
+import json
 import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 import boto3
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
 SSO_REGION = "us-west-2"
+SSO_START_URL = "https://d-9267e1e371.awsapps.com/start"
 ORG_PROFILE = "NDX/orgManagement"
 GROUP_NAME = "ndx_IsbUsersGroup"
 
 
-def check_sso_session(profile_name):
-    """Check if SSO session is valid for the given profile."""
-    try:
-        session = boto3.Session(profile_name=profile_name)
-        sts = session.client('sts')
-        sts.get_caller_identity()
-        return True
-    except Exception:
+def check_sso_token_valid():
+    """Check if a valid (non-expired) SSO access token exists in the local cache."""
+    cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not cache_dir.exists():
         return False
+    for f in cache_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("startUrl") != SSO_START_URL:
+            continue
+        if "accessToken" not in data or "expiresAt" not in data:
+            continue
+        expiry_str = data["expiresAt"].replace("Z", "+00:00")
+        try:
+            expiry = datetime.fromisoformat(expiry_str)
+        except ValueError:
+            continue
+        if expiry > datetime.now(timezone.utc):
+            return True
+    return False
 
 
 def ensure_sso_login(profile_name):
-    """Ensure SSO login for the given profile, only prompting if needed."""
-    if check_sso_session(profile_name):
-        print(f"  ✅ {profile_name} - session valid")
+    """Ensure SSO login, only prompting if the cached token is expired or missing."""
+    if check_sso_token_valid():
+        print(f"  ✅ SSO session valid")
         return
 
-    print(f"  🔐 {profile_name} - logging in...")
+    print(f"  🔐 SSO token expired, logging in...")
     result = subprocess.run(
         ["aws", "sso", "login", "--profile", profile_name],
         capture_output=False,
     )
     if result.returncode != 0:
         raise RuntimeError(f"❌ SSO login failed for profile {profile_name}")
-    print(f"  ✅ {profile_name} - login successful")
+    print(f"  ✅ SSO login successful")
 
 
 def get_identity_store_id(session):
