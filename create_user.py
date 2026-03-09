@@ -6,60 +6,18 @@ Uses the NDX/orgManagement profile for Identity Store API access.
 """
 
 import argparse
-import json
-import subprocess
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
 
 import boto3
 
-# ── Configuration ────────────────────────────────────────────────────────────
+from isb_common import (
+    SSO_REGION,
+    ORG_PROFILE,
+    ensure_sso_login,
+)
 
-SSO_REGION = "us-west-2"
-SSO_START_URL = "https://d-9267e1e371.awsapps.com/start"
-ORG_PROFILE = "NDX/orgManagement"
 GROUP_NAME = "ndx_IsbUsersGroup"
-
-
-def check_sso_token_valid():
-    """Check if a valid (non-expired) SSO access token exists in the local cache."""
-    cache_dir = Path.home() / ".aws" / "sso" / "cache"
-    if not cache_dir.exists():
-        return False
-    for f in cache_dir.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        if data.get("startUrl") != SSO_START_URL:
-            continue
-        if "accessToken" not in data or "expiresAt" not in data:
-            continue
-        expiry_str = data["expiresAt"].replace("Z", "+00:00")
-        try:
-            expiry = datetime.fromisoformat(expiry_str)
-        except ValueError:
-            continue
-        if expiry > datetime.now(timezone.utc):
-            return True
-    return False
-
-
-def ensure_sso_login(profile_name):
-    """Ensure SSO login, only prompting if the cached token is expired or missing."""
-    if check_sso_token_valid():
-        print(f"  ✅ SSO session valid")
-        return
-
-    print(f"  🔐 SSO token expired, logging in...")
-    result = subprocess.run(
-        ["aws", "sso", "login", "--profile", profile_name],
-        capture_output=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"❌ SSO login failed for profile {profile_name}")
-    print(f"  ✅ SSO login successful")
+PREAPPROVED_GROUP_NAME = "ndx-IsbPreapprovedGroup"
 
 
 def get_identity_store_id(session):
@@ -132,12 +90,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="Create a user in AWS Identity Center and add to ndx_IsbUsersGroup.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example:\n  python create_user.py --firstname=John --lastname=\"O'Donnel\" --email=\"foo@bar.com\"",
+        epilog="Examples:\n"
+               "  python create_user.py --firstname=John --lastname=\"O'Donnel\" --email=\"foo@bar.com\"\n"
+               "  python create_user.py --firstname=John --lastname=\"O'Donnel\" --email=\"foo@bar.com\" --preapproved",
     )
     parser.add_argument("--firstname", required=True, help="User's first name")
     parser.add_argument("--lastname", required=True, help="User's last name")
     parser.add_argument("--email", required=True, help="User's email address")
     parser.add_argument("--displayname", help="Display name (default: 'firstname lastname')")
+    parser.add_argument("--preapproved", action="store_true",
+                        help="Also add user to the pre-approved group for automated approval")
 
     args = parser.parse_args()
 
@@ -163,6 +125,11 @@ def main():
 
     group_id = find_group(identity_store, identity_store_id, GROUP_NAME)
     print(f"   Group: {GROUP_NAME} ({group_id})")
+
+    preapproved_group_id = None
+    if args.preapproved:
+        preapproved_group_id = find_group(identity_store, identity_store_id, PREAPPROVED_GROUP_NAME)
+        print(f"   Group: {PREAPPROVED_GROUP_NAME} ({preapproved_group_id})")
 
     # ── Step 3: Create User ──────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -191,9 +158,21 @@ def main():
 
     try:
         add_user_to_group(identity_store, identity_store_id, group_id, user_id)
-        print(f"   ✅ Added to group")
+        print(f"   ✅ Added to {GROUP_NAME}")
     except identity_store.exceptions.ConflictException:
-        print(f"   ⚠️  Already a member of group")
+        print(f"   ⚠️  Already a member of {GROUP_NAME}")
+
+    # ── Step 5 (optional): Add to Pre-approved Group ─────────────────────
+    if preapproved_group_id:
+        print(f"\n{'='*60}")
+        print(f"⭐ STEP 5: Add to {PREAPPROVED_GROUP_NAME}")
+        print("=" * 60)
+
+        try:
+            add_user_to_group(identity_store, identity_store_id, preapproved_group_id, user_id)
+            print(f"   ✅ Added to {PREAPPROVED_GROUP_NAME}")
+        except identity_store.exceptions.ConflictException:
+            print(f"   ⚠️  Already a member of {PREAPPROVED_GROUP_NAME}")
 
     # ── Done ─────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -201,7 +180,10 @@ def main():
     print("=" * 60)
     print(f"   User:    {display_name} ({args.email})")
     print(f"   User ID: {user_id}")
-    print(f"   Group:   {GROUP_NAME}")
+    groups_summary = GROUP_NAME
+    if preapproved_group_id:
+        groups_summary += f", {PREAPPROVED_GROUP_NAME}"
+    print(f"   Groups:  {groups_summary}")
 
 
 if __name__ == '__main__':

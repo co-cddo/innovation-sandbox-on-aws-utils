@@ -28,7 +28,6 @@ the script needs to be run with credentials for each user's SSO session.
 import argparse
 import base64
 import json
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -47,10 +46,15 @@ except ImportError:
 import urllib.request
 import urllib.error
 
+from isb_common import (
+    SSO_REGION,
+    ISB_HUB_PROFILE,
+    ensure_sso_login,
+    find_sso_access_token,
+)
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
-SSO_REGION = "us-west-2"
-SSO_START_URL = "https://d-9267e1e371.awsapps.com/start"
 SSO_INSTANCE_ARN = "arn:aws:sso:::instance/ssoins-79078bb87a820e72"
 SSO_IDENTITY_STORE_ID = "d-9267e1e371"
 ORG_PROFILE = "NDX/orgManagement"
@@ -96,9 +100,6 @@ CCS_SETTINGS_TO_CHECK = [
 DASHBOARD_ID = "console-home-unified"
 
 # ISB Hub profile for querying lease data via Lambda
-ISB_HUB_PROFILE = "NDX/InnovationSandboxHub"
-ISB_API_BASE_URL = "https://1ewlxhaey6.execute-api.us-west-2.amazonaws.com/prod/"
-ISB_JWT_SECRET_PATH = "/InnovationSandbox/ndx/Auth/JwtSecret"
 LEASES_LAMBDA = "ISB-LeasesLambdaFunction-ndx"
 
 # Cache for tracking which accounts have already been cleaned
@@ -285,59 +286,7 @@ def account_needs_cleaning(account_id, cache, last_lease_times, permission_sets_
     return False, f"cleaned {cleaned_at[:19]}, last lease {last_lease[:19]}"
 
 
-# ── SSO Authentication ───────────────────────────────────────────────────────
-
-def ensure_sso_login(profile_name):
-    """Ensure SSO login, only prompting if the cached token is expired or missing."""
-    if find_sso_access_token():
-        print(f"  ✅ SSO session valid")
-        return
-
-    print(f"  🔐 SSO token expired, logging in...")
-    result = subprocess.run(
-        ["aws", "sso", "login", "--profile", profile_name],
-        capture_output=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"❌ SSO login failed for profile {profile_name}")
-    print(f"  ✅ SSO login successful")
-
-
-def find_sso_access_token():
-    """Find a valid SSO access token from the AWS CLI cache."""
-    cache_dir = Path.home() / ".aws" / "sso" / "cache"
-    if not cache_dir.exists():
-        return None
-
-    best_token = None
-    best_expiry = None
-
-    for f in cache_dir.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-
-        if data.get("startUrl") != SSO_START_URL:
-            continue
-        if "accessToken" not in data or "expiresAt" not in data:
-            continue
-
-        expiry_str = data["expiresAt"].replace("Z", "+00:00")
-        try:
-            expiry = datetime.fromisoformat(expiry_str)
-        except ValueError:
-            continue
-
-        if expiry <= datetime.now(timezone.utc):
-            continue
-
-        if best_expiry is None or expiry > best_expiry:
-            best_token = data["accessToken"]
-            best_expiry = expiry
-
-    return best_token
-
+# ── SSO User Identity ────────────────────────────────────────────────────────
 
 def get_current_sso_user_id(session):
     """Get the Identity Store user ID for the current SSO user."""

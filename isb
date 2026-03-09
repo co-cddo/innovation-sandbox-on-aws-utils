@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+source "$SCRIPT_DIR/venv/bin/activate"
+
+case "${1:-}" in
+  assign)
+    shift
+    exec python "$SCRIPT_DIR/assign_lease.py" "$@"
+    ;;
+  terminate)
+    shift
+    exec python "$SCRIPT_DIR/terminate_lease.py" "$@"
+    ;;
+  templates)
+    exec python "$SCRIPT_DIR/assign_lease.py" --list-templates
+    ;;
+  create-user)
+    shift
+    exec python "$SCRIPT_DIR/create_user.py" "$@"
+    ;;
+  create-pool-account)
+    shift
+    exec python "$SCRIPT_DIR/create_sandbox_pool_account.py" "$@"
+    ;;
+  force-release)
+    shift
+    exec python "$SCRIPT_DIR/force_release_account.py" "$@"
+    ;;
+  close-account)
+    shift
+    exec python "$SCRIPT_DIR/close_account.py" "$@"
+    ;;
+  clean-console)
+    shift
+    exec python "$SCRIPT_DIR/clean_console_state.py" "$@"
+    ;;
+  help|--help|-h)
+    cat <<'USAGE'
+Usage: isb <command> [options]
+
+Manage Innovation Sandbox on AWS — leases, users, and the underlying
+AWS account pool that provides sandbox environments.
+
+Leases (get and release sandbox environments):
+  assign [template]          Get a sandbox by assigning a lease (default: empty-sandbox)
+  terminate                  Release all your active sandboxes
+  templates                  List available sandbox templates
+
+Users (manage who can use the sandbox):
+  create-user                Add a new user to Identity Center so they can access sandboxes
+    --firstname=NAME         First name (required)
+    --lastname=NAME          Last name (required)
+    --email=EMAIL            Email address (required)
+    --displayname=NAME       Display name (default: firstname lastname)
+    --preapproved            Skip manual approval for this user's lease requests
+
+Account pool (admin — manage the pool of AWS accounts backing sandboxes):
+  create-pool-account        Provision new AWS account(s) into the sandbox pool
+    --num=N                  Number of accounts to create in parallel (default: 1)
+    [ACCOUNT_ID]             Recovery mode: retry provisioning for a failed account
+
+  force-release              Unstick quarantined accounts so they return to the pool
+    ACCOUNT_ID [...]         One or more account IDs
+    --all                    Process all quarantined accounts
+
+  close-account              Eject account(s) from ISB and close them permanently
+    ACCOUNT_ID [...]         One or more account IDs
+    --quarantined            Auto-process long-quarantined accounts (>2 days)
+    --limit=N                Max accounts to process (with --quarantined)
+    --dry-run                Preview without making changes
+
+  clean-console              Reset AWS Console UI state (recently visited, favourites, theme)
+                             left behind on recycled sandbox accounts
+    --ou OU [OU ...]         Target OUs: Available, CleanUp, Quarantine (default: all)
+    --account ACCOUNT_ID     Clean a specific account only
+    --all-roles              Clean all permission sets (default: ndx_IsbUsersPS only)
+    --dry-run                Check state without making changes
+    --no-cache               Ignore cache, clean all accounts
+    --clear-cache            Clear the cleaning cache and exit
+USAGE
+    exit 0
+    ;;
+  *)
+    echo "Unknown command: ${1:-}" >&2
+    echo "Run 'isb help' for usage." >&2
+    exit 1
+    ;;
+esac
