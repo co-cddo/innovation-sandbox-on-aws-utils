@@ -1,0 +1,50 @@
+#compdef isb
+
+_isb() {
+  local -a commands
+  commands=(
+    'assign:Get a sandbox by assigning a lease'
+    'terminate:Release all your active sandboxes'
+    'templates:List available sandbox templates'
+    'create-user:Add a new user to Identity Center'
+    'create-pool-account:Provision new AWS account(s) into the sandbox pool'
+    'force-release:Unstick quarantined accounts'
+    'clean-console:Reset AWS Console UI state on recycled accounts'
+    'help:Show usage information'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+
+  case "${words[2]}" in
+    create-user)
+      _arguments \
+        '--firstname=[First name]:name' \
+        '--lastname=[Last name]:name' \
+        '--email=[Email address]:email' \
+        '--displayname=[Display name]:name' \
+        '--preapproved[Skip manual approval]'
+      ;;
+    create-pool-account)
+      _arguments \
+        '--num=[Number of accounts to create]:number'
+      ;;
+    force-release)
+      _arguments \
+        '--all[Process all quarantined accounts]'
+      ;;
+    clean-console)
+      _arguments \
+        '--ou[Target OUs]:ou:(Available CleanUp Quarantine)' \
+        '--account[Clean a specific account]:account_id' \
+        '--all-roles[Clean all permission sets]' \
+        '--dry-run[Check state without making changes]' \
+        '--no-cache[Ignore cache]' \
+        '--clear-cache[Clear the cleaning cache and exit]'
+      ;;
+  esac
+}
+
+_isb "$@"
