@@ -100,9 +100,19 @@ def wait_for_sso_refresh(profile_name):
 
 
 def ensure_session(profile_name):
-    """Get a boto3 session, refreshing SSO token if needed."""
-    if not check_sso_token_valid():
-        wait_for_sso_refresh(profile_name)
+    """Get a boto3 session, refreshing SSO token if needed.
+
+    Verifies the token actually works by attempting to create a session.
+    Falls back to SSO refresh if the cached token is stale or revoked.
+    """
+    if check_sso_token_valid():
+        try:
+            session = boto3.Session(profile_name=profile_name)
+            session.client("sts").get_caller_identity()
+            return session
+        except Exception:
+            pass
+    wait_for_sso_refresh(profile_name)
     return boto3.Session(profile_name=profile_name)
 
 

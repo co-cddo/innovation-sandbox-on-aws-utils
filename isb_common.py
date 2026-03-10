@@ -101,14 +101,36 @@ def sso_login(profile_name):
         raise RuntimeError(f"❌ SSO login failed for profile {profile_name}")
 
 
+_sso_verified = False
+
+
 def ensure_sso_login(profile_name):
-    """Ensure SSO login, only prompting if the cached token is expired or missing."""
-    if check_sso_token_valid():
+    """Ensure SSO login, verifying the token actually works against AWS.
+
+    On first call, validates the cached token by making a real STS API call.
+    Subsequent calls in the same process skip the API check since all profiles
+    share the same SSO token.
+    """
+    global _sso_verified
+
+    if _sso_verified:
         print(f"  ✅ SSO session valid")
         return
 
-    print(f"  🔐 SSO token expired, logging in...")
+    if check_sso_token_valid():
+        try:
+            session = boto3.Session(profile_name=profile_name)
+            sts = session.client("sts")
+            sts.get_caller_identity()
+            _sso_verified = True
+            print(f"  ✅ SSO session valid")
+            return
+        except Exception:
+            pass
+
+    print(f"  🔐 SSO token expired or invalid, logging in...")
     sso_login(profile_name)
+    _sso_verified = True
     print(f"  ✅ SSO login successful")
 
 
