@@ -151,8 +151,13 @@ def update_aws_config_profiles(account_id):
 def sso_login_sandbox_profiles():
     """Run aws sso login for the sandbox profiles if needed."""
     if check_sso_token_valid():
-        print(f"  ✅ SSO session valid")
-        return
+        try:
+            session = boto3.Session(profile_name="NDX/SandboxUser")
+            session.client("sts").get_caller_identity()
+            print(f"  ✅ SSO session valid")
+            return
+        except Exception:
+            pass
     for profile_name in ("NDX/SandboxUser", "NDX/SandboxAdmin"):
         print(f"  🔐 {profile_name} - logging in...")
         result = subprocess.run(
