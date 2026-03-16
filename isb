@@ -20,6 +20,10 @@ case "${1:-}" in
     shift
     exec python "$SCRIPT_DIR/create_user.py" "$@"
     ;;
+  list-users)
+    shift
+    exec python "$SCRIPT_DIR/list_users.py" "$@"
+    ;;
   create-pool-account)
     shift
     exec python "$SCRIPT_DIR/create_sandbox_pool_account.py" "$@"
@@ -55,6 +59,11 @@ Users (manage who can use the sandbox):
     --email=EMAIL            Email address (required)
     --displayname=NAME       Display name (default: firstname lastname)
     --preapproved            Skip manual approval for this user's lease requests
+
+  list-users [PATTERN]       List ISB users, with optional wildcard filtering
+    PATTERN                  Glob pattern (e.g. '*@amazon.co.uk', '*@*.gov.uk')
+    --all                    Show all Identity Center users, not just ISB group members
+    --groups                 Show group membership columns
 
 Account pool (admin — manage the pool of AWS accounts backing sandboxes):
   create-pool-account        Provision new AWS account(s) into the sandbox pool
