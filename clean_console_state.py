@@ -311,12 +311,37 @@ def get_current_sso_user_id(session):
 # ── Organizations ────────────────────────────────────────────────────────────
 
 def list_accounts_in_ou(session, ou_id):
-    """List all accounts in an OU, handling pagination."""
+    """List all accounts in an OU, handling pagination and throttling."""
+    import botocore.exceptions
+    import random
+
     client = session.client("organizations")
     accounts = []
-    paginator = client.get_paginator("list_accounts_for_parent")
-    for page in paginator.paginate(ParentId=ou_id):
-        accounts.extend(page["Accounts"])
+    next_token = None
+
+    while True:
+        kwargs = {"ParentId": ou_id, "MaxResults": 20}
+        if next_token:
+            kwargs["NextToken"] = next_token
+
+        for attempt in range(8):
+            try:
+                response = client.list_accounts_for_parent(**kwargs)
+                break
+            except botocore.exceptions.ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("TooManyRequestsException", "Throttling") and attempt < 7:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(delay)
+                    continue
+                raise
+
+        accounts.extend(response.get("Accounts", []))
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+        time.sleep(0.5)  # pace between pages
+
     return accounts
 
 

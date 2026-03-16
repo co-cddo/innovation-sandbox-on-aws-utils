@@ -36,6 +36,10 @@ ACTIVE_OU = "ou-2laj-sre4rnjs"
 
 def list_pool_accounts(org_client, parent_ou=POOL_OU, exclude_ous=None):
     """Recursively list all accounts under the pool OU, excluding specified OUs."""
+    import botocore.exceptions
+    import random
+    import time
+
     if exclude_ous is None:
         exclude_ous = {ACTIVE_OU}
 
@@ -44,10 +48,27 @@ def list_pool_accounts(org_client, parent_ou=POOL_OU, exclude_ous=None):
 
     accounts = []
 
-    # List accounts directly in this OU
-    paginator = org_client.get_paginator("list_accounts_for_parent")
-    for page in paginator.paginate(ParentId=parent_ou):
-        accounts.extend(page["Accounts"])
+    # List accounts directly in this OU (with throttle retry)
+    next_token = None
+    while True:
+        kwargs = {"ParentId": parent_ou, "MaxResults": 20}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        for attempt in range(8):
+            try:
+                response = org_client.list_accounts_for_parent(**kwargs)
+                break
+            except botocore.exceptions.ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("TooManyRequestsException", "Throttling") and attempt < 7:
+                    time.sleep((2 ** attempt) + random.uniform(0, 1))
+                    continue
+                raise
+        accounts.extend(response.get("Accounts", []))
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+        time.sleep(0.5)
 
     # Recurse into child OUs
     ou_paginator = org_client.get_paginator("list_organizational_units_for_parent")

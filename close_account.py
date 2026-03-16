@@ -290,9 +290,14 @@ def main():
 
         # 3a: Check Exit OU for leftover accounts from previous runs
         print("  🔍 Checking Exit OU for leftover accounts...")
-        exit_accounts = list_accounts_in_ou(org_session, EXIT_OU)
+        all_exit_accounts = list_accounts_in_ou(org_session, EXIT_OU)
+        exit_accounts = [a for a in all_exit_accounts if a.get("Status") != "SUSPENDED"]
+        if all_exit_accounts:
+            skipped = len(all_exit_accounts) - len(exit_accounts)
+            if skipped:
+                print(f"  ℹ️  Skipping {skipped} already-closed (SUSPENDED) account(s)")
         if exit_accounts:
-            print(f"  📦 Found {len(exit_accounts)} leftover account(s) in Exit OU:")
+            print(f"  📦 Found {len(exit_accounts)} active account(s) in Exit OU:")
             for acct in exit_accounts:
                 print(f"     {acct['Id']} {acct.get('Name', '')}")
 

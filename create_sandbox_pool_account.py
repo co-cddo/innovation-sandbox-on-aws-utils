@@ -455,9 +455,26 @@ def print_pool_summary(session):
     total = 0
     for name, ou_id in POOL_OUS.items():
         count = 0
-        paginator = client.get_paginator('list_accounts_for_parent')
-        for page in paginator.paginate(ParentId=ou_id):
-            count += len(page['Accounts'])
+        next_token = None
+        while True:
+            kwargs = {'ParentId': ou_id, 'MaxResults': 20}
+            if next_token:
+                kwargs['NextToken'] = next_token
+            for attempt in range(8):
+                try:
+                    response = client.list_accounts_for_parent(**kwargs)
+                    break
+                except botocore.exceptions.ClientError as e:
+                    code = e.response['Error']['Code']
+                    if code in ('TooManyRequestsException', 'Throttling') and attempt < 7:
+                        time.sleep((2 ** attempt) + random.uniform(0, 1))
+                        continue
+                    raise
+            count += len(response.get('Accounts', []))
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+            time.sleep(0.5)
         total += count
         print(f"   {name:<12} {count:>3}")
     print(f"   {'Total':<12} {total:>3}")
