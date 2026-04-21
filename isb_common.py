@@ -104,6 +104,51 @@ def sso_login(profile_name):
 _sso_verified = False
 
 
+def invalidate_sso_cache():
+    """Delete cached SSO tokens for our SSO start URL.
+
+    Forces the next ``aws sso login`` to open a fresh browser
+    authentication — needed when the user has authenticated as the
+    wrong identity (e.g. a non-admin user).
+    """
+    global _sso_verified
+    _sso_verified = False
+    cache_dir = Path.home() / ".aws" / "sso" / "cache"
+    if not cache_dir.exists():
+        return
+    for f in cache_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("startUrl") == SSO_START_URL:
+            f.unlink(missing_ok=True)
+
+
+def _is_sso_token_expired_error(exc):
+    msg = str(exc).lower()
+    return "token" in msg and ("expired" in msg or "refresh failed" in msg)
+
+
+def call_with_sso_retry(profile_name, func):
+    """Call ``func(session)`` with automatic retry on SSO token expiry.
+
+    If the SSO token has expired server-side between session creation and
+    the actual API call (common for long-running scripts), re-runs
+    ``aws sso login``, rebuilds the session, and retries once.
+    """
+    session = boto3.Session(profile_name=profile_name)
+    try:
+        return func(session)
+    except Exception as e:
+        if not _is_sso_token_expired_error(e):
+            raise
+        print("  🔐 SSO token expired, re-authenticating...")
+        sso_login(profile_name)
+        session = boto3.Session(profile_name=profile_name)
+        return func(session)
+
+
 def ensure_sso_login(profile_name):
     """Ensure SSO login, verifying the token actually works against AWS.
 
@@ -191,13 +236,12 @@ def get_signed_token(session, email=None, profile_name=ISB_HUB_PROFILE):
     try:
         jwt_secret = fetch_jwt_secret(session)
     except Exception as e:
-        if "expired" in str(e).lower() and "token" in str(e).lower():
-            print("  🔐 SSO token expired server-side, re-authenticating...")
-            sso_login(profile_name)
-            session = boto3.Session(profile_name=profile_name)
-            jwt_secret = fetch_jwt_secret(session)
-        else:
+        if not _is_sso_token_expired_error(e):
             raise
+        print("  🔐 SSO token expired server-side, re-authenticating...")
+        sso_login(profile_name)
+        session = boto3.Session(profile_name=profile_name)
+        jwt_secret = fetch_jwt_secret(session)
 
     return sign_jwt(payload, jwt_secret)
 
