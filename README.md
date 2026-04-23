@@ -178,16 +178,22 @@ source venv/bin/activate
 # Create a user
 python create_user.py --firstname=John --lastname="O'Donnel" --email="foo@bar.com"
 
+# Create a user from an RFC 5322 recipient string (name + email in one)
+python create_user.py '"Jane Smith" <jane@example.com>'
+
 # Create a user with a custom display name
 python create_user.py --firstname=Jane --lastname=Doe --email="jane@example.com" --displayname="Dr Jane Doe"
 ```
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `--firstname` | Yes | User's first name |
-| `--lastname` | Yes | User's last name |
-| `--email` | Yes | User's email address (also used as username) |
+| `recipient` | No | RFC 5322 recipient string like `"First Last" <email>` — sets firstname/lastname/email in one go |
+| `--firstname` | Yes* | User's first name |
+| `--lastname` | Yes* | User's last name |
+| `--email` | Yes* | User's email address (also used as username) |
 | `--displayname` | No | Display name (defaults to `firstname lastname`) |
+
+\* Required unless supplied via the `recipient` positional argument.
 
 ### What it does
 
