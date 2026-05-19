@@ -54,9 +54,10 @@ Leases (get and release sandbox environments):
 
 Users (manage who can use the sandbox):
   create-user                Add a new user to Identity Center so they can access sandboxes
-    --firstname=NAME         First name (required)
-    --lastname=NAME          Last name (required)
-    --email=EMAIL            Email address (required)
+    "Name" <email>           RFC 5322 recipient string (alternative to the flags below)
+    --firstname=NAME         First name
+    --lastname=NAME          Last name
+    --email=EMAIL            Email address
     --displayname=NAME       Display name (default: firstname lastname)
     --preapproved            Skip manual approval for this user's lease requests
 

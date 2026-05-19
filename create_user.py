@@ -10,6 +10,7 @@ import json
 import sys
 import uuid
 from datetime import datetime, timezone
+from email.utils import parseaddr
 
 import boto3
 
@@ -117,16 +118,37 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  python create_user.py --firstname=John --lastname=\"O'Donnel\" --email=\"foo@bar.com\"\n"
+               "  python create_user.py '\"Jane Smith\" <jane@example.com>'\n"
                "  python create_user.py --firstname=John --lastname=\"O'Donnel\" --email=\"foo@bar.com\" --preapproved",
     )
-    parser.add_argument("--firstname", required=True, help="User's first name")
-    parser.add_argument("--lastname", required=True, help="User's last name")
-    parser.add_argument("--email", required=True, help="User's email address")
+    parser.add_argument("recipient", nargs="?",
+                        help="RFC 5322 recipient string, e.g. '\"Jane Doe\" <jane@example.com>' "
+                             "(alternative to --firstname/--lastname/--email)")
+    parser.add_argument("--firstname", help="User's first name")
+    parser.add_argument("--lastname", help="User's last name")
+    parser.add_argument("--email", help="User's email address")
     parser.add_argument("--displayname", help="Display name (default: 'firstname lastname')")
     parser.add_argument("--preapproved", action="store_true",
                         help="Also add user to the pre-approved group for automated approval")
 
     args = parser.parse_args()
+
+    if args.recipient:
+        name, email = parseaddr(args.recipient)
+        if not email or "@" not in email:
+            parser.error(f"could not extract email address from {args.recipient!r}")
+        if not name:
+            parser.error(f"could not extract display name from {args.recipient!r} — expected '\"First Last\" <email>'")
+        name_parts = name.strip().split()
+        if len(name_parts) < 2:
+            parser.error(f"display name {name!r} must contain a first name and last name")
+        args.firstname = args.firstname or name_parts[0]
+        args.lastname = args.lastname or " ".join(name_parts[1:])
+        args.email = args.email or email
+
+    missing = [f for f in ("firstname", "lastname", "email") if not getattr(args, f)]
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(f"--{m}" for m in missing))
 
     # Normalize email to lowercase (consistent with signup Lambda)
     args.email = args.email.strip().lower()
