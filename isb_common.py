@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import json
+import socket
 import subprocess
 import time
 import urllib.error
@@ -275,18 +276,33 @@ def make_isb_api_request(method, path, token, body=None, query_params=None):
         method=method,
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            status_code = response.status
-            response_body = json.loads(response.read().decode())
-    except urllib.error.HTTPError as e:
-        status_code = e.code
+    # Retry transient network/server errors. 4xx surfaces immediately so a
+    # genuine bad request (auth, malformed body) doesn't get retried four times.
+    # Delays sit inside the per-request 30s socket timeout so total wallclock
+    # is bounded — at most ~2m worst case before we give up.
+    last_transient = None
+    for attempt in range(4):
         try:
-            response_body = json.loads(e.read().decode())
-        except Exception:
-            response_body = {}
-
-    return status_code, response_body
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return response.status, json.loads(response.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (500, 502, 503, 504) and attempt < 3:
+                last_transient = e
+                time.sleep(2 ** attempt)
+                continue
+            try:
+                body = json.loads(e.read().decode())
+            except Exception:
+                body = {}
+            return e.code, body
+        except (ConnectionResetError, socket.timeout, urllib.error.URLError) as e:
+            if attempt < 3:
+                last_transient = e
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    # Defensive: loop exit without return means the final attempt re-raised.
+    raise last_transient  # type: ignore[misc]
 
 
 # ── User identity ────────────────────────────────────────────────────────────
