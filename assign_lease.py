@@ -341,7 +341,7 @@ def main():
 
         start_wait = time.time()
         check_interval = 5
-        max_wait = 1800  # 30 minutes
+        max_wait = 3600  # 60 minutes
 
         while True:
             elapsed = time.time() - start_wait

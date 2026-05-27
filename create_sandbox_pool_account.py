@@ -23,19 +23,20 @@ import urllib.error
 import urllib.request
 
 import boto3
+import botocore.config
 import botocore.exceptions
 
 from isb_common import (
     SSO_START_URL,
     check_sso_token_valid,
     ensure_sso_login,
+    invalidate_sso_cache,
     sign_jwt,
+    sso_login,
     fetch_jwt_secret,
     format_duration,
 )
 
-# Target OU where Innovation Sandbox moves accounts after cleanup
-SANDBOX_READY_OU = "ou-2laj-oihxgbtr"
 ENTRY_OU = "ou-2laj-2by9v0sr"
 
 POOL_OUS = {
@@ -53,12 +54,6 @@ _root_id_lock = threading.Lock()
 # StackSet that deploys SandboxAccountRole into pool accounts
 SANDBOX_STACKSET_NAME = "Isb-ndx-SandboxAccountResources"
 
-# Custom billing view ARN for tracking pool account costs
-BILLING_VIEW_ARN = "arn:aws:billing::955063685555:billingview/custom-466e2613-e09b-4787-a93a-736f0fb1564b"
-
-# Lock for billing view read-modify-write operations
-_billing_lock = threading.Lock()
-
 # Thread-safe SSO token refresh coordination
 _sso_refresh_lock = threading.Lock()
 
@@ -68,6 +63,18 @@ AUTH_ERROR_CODES = {
     'UnauthorizedSSOTokenError',
     'InvalidIdentityToken',
 }
+
+
+def _is_sso_auth_error(e):
+    """Check if an exception indicates an SSO authentication or permission problem."""
+    if isinstance(e, (botocore.exceptions.SSOTokenLoadError,
+                      botocore.exceptions.UnauthorizedSSOTokenError)):
+        return True
+    # TokenRetrievalError — SSO token expired/revoked/invalidated
+    if type(e).__name__ == 'TokenRetrievalError':
+        return True
+    error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
+    return error_code in AUTH_ERROR_CODES or error_code == 'AccessDeniedException'
 
 
 # ── Thread-safe SSO session management ────────────────────────────────────────
@@ -104,16 +111,21 @@ def ensure_session(profile_name):
 
     Verifies the token actually works by attempting to create a session.
     Falls back to SSO refresh if the cached token is stale or revoked.
+    Retries to handle race conditions where another thread invalidates
+    the SSO cache during concurrent operations.
     """
-    if check_sso_token_valid():
+    for attempt in range(3):
+        if not check_sso_token_valid():
+            wait_for_sso_refresh(profile_name)
         try:
             session = boto3.Session(profile_name=profile_name)
             session.client("sts").get_caller_identity()
             return session
         except Exception:
-            pass
-    wait_for_sso_refresh(profile_name)
-    return boto3.Session(profile_name=profile_name)
+            if attempt == 2:
+                raise
+            # Token may have been invalidated by another thread — retry
+            wait_for_sso_refresh(profile_name)
 
 
 # ── Account operations ───────────────────────────────────────────────────────
@@ -133,7 +145,7 @@ def get_all_accounts(session):
 def get_next_pool_number(pool_accounts):
     """Find the highest pool number and return the next one."""
     max_number = 0
-    pattern = re.compile(r'^pool-(\d{3})$')
+    pattern = re.compile(r'^pool-(\d+)$')
 
     for acc in pool_accounts:
         match = pattern.match(acc['Name'])
@@ -153,22 +165,22 @@ def _retry_with_backoff(func, label="", max_retries=8, base_delay=2, profile_nam
     while True:
         try:
             return func()
-        except (botocore.exceptions.SSOTokenLoadError, botocore.exceptions.UnauthorizedSSOTokenError) as e:
-            if profile_name and auth_retries < 3:
-                auth_retries += 1
-                print(f"\r{p}   🔐 SSO token error, refreshing...", flush=True)
-                wait_for_sso_refresh(profile_name)
-                continue
-            raise
         except Exception as e:
-            error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
-
-            if error_code in AUTH_ERROR_CODES and profile_name and auth_retries < 3:
+            if _is_sso_auth_error(e) and profile_name and auth_retries < 3:
                 auth_retries += 1
-                print(f"\r{p}   🔐 SSO token error ({error_code}), refreshing...", flush=True)
+                needs_invalidation = (
+                    getattr(e, 'response', {}).get('Error', {}).get('Code', '') == 'AccessDeniedException'
+                    or type(e).__name__ == 'TokenRetrievalError'
+                )
+                if needs_invalidation:
+                    print(f"\r{p}   🔐 Access denied — wrong SSO user? Re-authenticating...", flush=True)
+                    invalidate_sso_cache()
+                else:
+                    print(f"\r{p}   🔐 SSO token error, refreshing...", flush=True)
                 wait_for_sso_refresh(profile_name)
                 continue
 
+            error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
             if error_code in ('TooManyRequestsException', 'Throttling', 'ConcurrentModificationException') and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
                 print(f"\r{p}   ⏳ Rate limited, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})...", end="", flush=True)
@@ -262,55 +274,6 @@ def get_account_ou(session, account_id, label="", profile_name=None):
     return None
 
 
-def add_account_to_billing_view(session, account_id, label=""):
-    """Add an account to the custom billing view.
-
-    Uses read-modify-write pattern since there's no incremental add API.
-    Continues with warning on failure (non-blocking).
-    """
-    p = f"{label} " if label else ""
-    try:
-        billing_client = session.client('billing')
-
-        # Get current billing view
-        print(f"{p}   📊 Fetching current billing view...")
-        response = billing_client.get_billing_view(arn=BILLING_VIEW_ARN)
-        billing_view = response['billingView']
-
-        # Get existing accounts from the filter expression
-        data_filter = billing_view.get('dataFilterExpression', {})
-        dimensions = data_filter.get('dimensions', {})
-        existing_accounts = dimensions.get('values', [])
-
-        # Check if account already exists
-        if account_id in existing_accounts:
-            print(f"{p}   ℹ️  Account {account_id} already in billing view")
-            return True
-
-        # Add new account
-        updated_accounts = existing_accounts + [account_id]
-        print(f"{p}   📝 Adding account (total will be {len(updated_accounts)} accounts)")
-
-        # Update billing view
-        billing_client.update_billing_view(
-            arn=BILLING_VIEW_ARN,
-            dataFilterExpression={
-                'dimensions': {
-                    'key': 'LINKED_ACCOUNT',
-                    'values': updated_accounts
-                }
-            }
-        )
-
-        print(f"{p}   ✅ Added account to billing view")
-        return True
-
-    except Exception as e:
-        print(f"{p}   ⚠️  Warning: Failed to add account to billing view: {e}")
-        print(f"{p}   ℹ️  Continuing with remaining steps...")
-        return False
-
-
 def wait_for_stackset_role(session, account_id, check_interval=10, max_wait=300, label="", profile_name=None):
     """Wait for the SandboxAccountResources StackSet to deploy to an account.
 
@@ -341,18 +304,14 @@ def wait_for_stackset_role(session, account_id, check_interval=10, max_wait=300,
                 print(f"\r{p}   ⏳ StackSet status: {status} | Elapsed: {format_duration(waited)}", end="", flush=True)
             else:
                 print(f"\r{p}   ⏳ Waiting for StackSet instance... | Elapsed: {format_duration(waited)}", end="", flush=True)
-        except (botocore.exceptions.SSOTokenLoadError, botocore.exceptions.UnauthorizedSSOTokenError):
-            if profile_name:
-                print(f"\r{p}   🔐 SSO token error, refreshing...", flush=True)
-                wait_for_sso_refresh(profile_name)
-                session = ensure_session(profile_name)
-                cf = session.client('cloudformation')
-                continue
-            raise
         except Exception as e:
-            error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
-            if error_code in AUTH_ERROR_CODES and profile_name:
-                print(f"\r{p}   🔐 SSO token error ({error_code}), refreshing...", flush=True)
+            if _is_sso_auth_error(e) and profile_name:
+                error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
+                if error_code == 'AccessDeniedException' or type(e).__name__ == 'TokenRetrievalError':
+                    print(f"\r{p}   🔐 Access denied — wrong SSO user? Re-authenticating...", flush=True)
+                    invalidate_sso_cache()
+                else:
+                    print(f"\r{p}   🔐 SSO token error, refreshing...", flush=True)
                 wait_for_sso_refresh(profile_name)
                 session = ensure_session(profile_name)
                 cf = session.client('cloudformation')
@@ -459,32 +418,26 @@ def register_with_innovation_sandbox(account_id, api_base_url, jwt_secret, label
         return False
 
 
-def print_pool_summary(session):
+def print_pool_summary(session, profile_name=None):
     """Print account counts for each OU in the sandbox pool."""
-    client = session.client('organizations')
+    client = session.client(
+        'organizations',
+        config=botocore.config.Config(
+            retries={"mode": "adaptive", "max_attempts": 10},
+        ),
+    )
     total = 0
-    for name, ou_id in POOL_OUS.items():
+    for i, (name, ou_id) in enumerate(POOL_OUS.items()):
+        if i > 0:
+            time.sleep(0.5)  # spread requests to avoid throttling
         count = 0
-        next_token = None
-        while True:
-            kwargs = {'ParentId': ou_id, 'MaxResults': 20}
-            if next_token:
-                kwargs['NextToken'] = next_token
-            for attempt in range(8):
-                try:
-                    response = client.list_accounts_for_parent(**kwargs)
-                    break
-                except botocore.exceptions.ClientError as e:
-                    code = e.response['Error']['Code']
-                    if code in ('TooManyRequestsException', 'Throttling') and attempt < 7:
-                        time.sleep((2 ** attempt) + random.uniform(0, 1))
-                        continue
-                    raise
-            count += len(response.get('Accounts', []))
-            next_token = response.get('NextToken')
-            if not next_token:
-                break
-            time.sleep(0.5)
+        paginator = client.get_paginator('list_accounts_for_parent')
+        for page in _retry_with_backoff(
+            lambda p=paginator, oid=ou_id: list(p.paginate(ParentId=oid)),
+            label=f"   {name}",
+            profile_name=profile_name,
+        ):
+            count += len(page['Accounts'])
         total += count
         print(f"   {name:<12} {count:>3}")
     print(f"   {'Total':<12} {total:>3}")
@@ -625,7 +578,11 @@ def recover_account(session, account_id, profile_name=None):
 
 
 def provision_account(profile_name, account_name, email, api_base_url, jwt_secret, label=""):
-    """Provision a single pool account: create, move, tag, register, and wait.
+    """Provision a single pool account: create, move, tag, register.
+
+    Runs tag + register in parallel with the StackSet wait since they don't
+    depend on the SandboxAccountRole. The ISB cleanup pipeline moves the
+    account to Available autonomously, so we don't wait for it.
 
     Uses ensure_session() at each major step so credentials are refreshed
     automatically if the SSO token expires during long-running provisioning.
@@ -654,38 +611,43 @@ def provision_account(profile_name, account_name, email, api_base_url, jwt_secre
         root_id = get_root_id(session)
         move_account_to_ou(session, account_id, ENTRY_OU, source_parent_id=root_id, label=label, profile_name=profile_name)
 
+        # Wait for StackSet + tag in parallel. Registration MUST happen
+        # after the StackSet deploys the SandboxAccountRole, because the
+        # ISB API immediately triggers the cleanup Step Function which
+        # expects that role to exist.
         print(f"\n{p}{'='*60}")
-        print(f"{p}⏳ Wait for SandboxAccountRole (StackSet): {account_name}")
+        print(f"{p}⏳ StackSet + Tag (parallel): {account_name}")
         print(f"{p}{'='*60}")
-        session = ensure_session(profile_name)
-        if not wait_for_stackset_role(session, account_id, label=label, profile_name=profile_name):
+
+        stackset_ok = False
+
+        def _wait_stackset():
+            nonlocal stackset_ok
+            s = ensure_session(profile_name)
+            stackset_ok = wait_for_stackset_role(s, account_id, label=label, profile_name=profile_name)
+
+        def _tag():
+            s = ensure_session(profile_name)
+            tag_account(s, account_id, label=label)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(_wait_stackset), ex.submit(_tag)]
+            concurrent.futures.wait(futures)
+            for f in futures:
+                f.result()
+
+        if not stackset_ok:
             print(f"\n{p}❌ StackSet deployment timed out for {account_name}")
             return (account_name, None)
 
-        print(f"\n{p}{'='*60}")
-        print(f"{p}💰 Add to Billing View: {account_name}")
-        print(f"{p}{'='*60}")
-        session = ensure_session(profile_name)
-        with _billing_lock:
-            add_account_to_billing_view(session, account_id, label=label)
-
-        print(f"\n{p}{'='*60}")
-        print(f"{p}🏷️  Tag Account: {account_name}")
-        print(f"{p}{'='*60}")
-        session = ensure_session(profile_name)
-        tag_account(session, account_id, label=label)
-
+        # Register with ISB API only after StackSet confirms the
+        # SandboxAccountRole is deployed — this triggers cleanup.
         print(f"\n{p}{'='*60}")
         print(f"{p}📝 Register with Innovation Sandbox: {account_name}")
         print(f"{p}{'='*60}")
         register_with_innovation_sandbox(account_id, api_base_url, jwt_secret, label=label)
 
-        print(f"\n{p}{'='*60}")
-        print(f"{p}🧹 Wait for cleanup: {account_name}")
-        print(f"{p}{'='*60}")
-        session = ensure_session(profile_name)
-        wait_for_ou_move(session, account_id, SANDBOX_READY_OU, label=label, profile_name=profile_name)
-
+        print(f"\n{p}✅ Provisioning complete for {account_name} (cleanup runs autonomously)")
         return (account_name, account_id)
 
     except Exception as e:
@@ -730,8 +692,29 @@ def main():
     org_profile = 'NDX/orgManagement'
     hub_profile = 'NDX/InnovationSandboxHub'
 
-    # Create initial session (will be refreshed via ensure_session as needed)
+    # Create initial session and verify it has the right permissions.
+    # Catches the common case where the user authenticated with the wrong
+    # SSO identity (e.g. a non-admin user that lacks Organizations access).
     session = ensure_session(org_profile)
+    for _auth_attempt in range(3):
+        try:
+            session.client('organizations').describe_organization()
+            break
+        except Exception as e:
+            if not _is_sso_auth_error(e):
+                raise
+            if _auth_attempt == 2:
+                print("\n❌ Cannot access AWS Organizations after re-authentication.")
+                print(f"   Ensure you log into the SSO portal as a user with the {org_profile} permission set.")
+                print("   You may need to log out of the SSO portal in your browser first.")
+                sys.exit(1)
+            print("\n⚠️  Current SSO session cannot access AWS Organizations.")
+            print("   You may have authenticated with the wrong user.")
+            print("   Clearing cached credentials and re-authenticating...")
+            print("   (Please ensure you log in as an admin user)\n")
+            invalidate_sso_cache()
+            sso_login(org_profile)
+            session = ensure_session(org_profile)
 
     # Pre-fetch ISB registration config (shared across all threads)
     api_base_url = os.environ.get("ISB_API_BASE_URL")
@@ -740,10 +723,27 @@ def main():
         print("❌ ISB_API_BASE_URL and ISB_JWT_SECRET_PATH environment variables must be set")
         sys.exit(1)
 
-    hub_session = ensure_session(hub_profile)
-    print("\n🔑 Fetching JWT secret...")
-    jwt_secret = fetch_jwt_secret(hub_session, jwt_secret_path)
-    print("   ✅ JWT secret ready")
+    for _auth_attempt in range(3):
+        try:
+            hub_session = ensure_session(hub_profile)
+            print("\n🔑 Fetching JWT secret...")
+            jwt_secret = fetch_jwt_secret(hub_session, jwt_secret_path)
+            print("   ✅ JWT secret ready")
+            break
+        except Exception as e:
+            if not _is_sso_auth_error(e):
+                raise
+            if _auth_attempt == 2:
+                print(f"\n❌ Cannot access {hub_profile} after re-authentication.")
+                print("   Ensure your SSO user has the required permission set.")
+                print("   You may need to log out of the SSO portal in your browser first.")
+                sys.exit(1)
+            print(f"\n⚠️  Current SSO session cannot access {hub_profile}.")
+            print("   You may have authenticated with the wrong user.")
+            print("   Clearing cached credentials and re-authenticating...")
+            print("   (Please ensure you log in as an admin user)\n")
+            invalidate_sso_cache()
+            sso_login(hub_profile)
 
     if args.account_id:
         # Recovery mode - fix a partially provisioned account
@@ -755,37 +755,37 @@ def main():
         session = ensure_session(org_profile)
         recover_account(session, account_id, profile_name=org_profile)
 
+        # Wait for StackSet + tag in parallel
         print(f"\n{'='*60}")
-        print(f"⏳ Wait for SandboxAccountRole (StackSet)")
+        print(f"⏳ StackSet + Tag (parallel)")
         print(f"{'='*60}")
-        session = ensure_session(org_profile)
-        if not wait_for_stackset_role(session, account_id, profile_name=org_profile):
+
+        stackset_ok = False
+
+        def _wait_stackset():
+            nonlocal stackset_ok
+            s = ensure_session(org_profile)
+            stackset_ok = wait_for_stackset_role(s, account_id, profile_name=org_profile)
+
+        def _tag():
+            s = ensure_session(org_profile)
+            tag_account(s, account_id)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(_wait_stackset), ex.submit(_tag)]
+            concurrent.futures.wait(futures)
+            for f in futures:
+                f.result()
+
+        if not stackset_ok:
             print("\n❌ StackSet deployment timed out - exiting")
             sys.exit(1)
 
-        # Add to billing view for recovered accounts
-        print(f"\n{'='*60}")
-        print(f"💰 Add to Billing View")
-        print(f"{'='*60}")
-        session = ensure_session(org_profile)
-        add_account_to_billing_view(session, account_id)
-
-        print(f"\n{'='*60}")
-        print(f"🏷️  Tag Account")
-        print(f"{'='*60}")
-        session = ensure_session(org_profile)
-        tag_account(session, account_id)
-
+        # Register after StackSet confirms role is deployed
         print(f"\n{'='*60}")
         print(f"📝 Register with Innovation Sandbox")
         print(f"{'='*60}")
         register_with_innovation_sandbox(account_id, api_base_url, jwt_secret)
-
-        print(f"\n{'='*60}")
-        print(f"🧹 Wait for Innovation Sandbox cleanup")
-        print(f"{'='*60}")
-        session = ensure_session(org_profile)
-        wait_for_ou_move(session, account_id, SANDBOX_READY_OU, profile_name=org_profile)
 
         print(f"\n{'='*60}")
         print(f"🛡️  Deploy SCPs")
@@ -805,7 +805,7 @@ def main():
         print(f"📊 Pool account summary")
         print(f"{'='*60}")
         session = ensure_session(org_profile)
-        print_pool_summary(session)
+        print_pool_summary(session, profile_name=org_profile)
 
     else:
         # Normal mode - create new account(s)
@@ -859,9 +859,9 @@ def main():
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 futures = {}
                 for i, (name, email) in enumerate(accounts_to_create):
-                    # Stagger submissions to avoid Organizations API rate limits
+                    # Brief stagger to avoid duplicate request IDs
                     if i > 0:
-                        time.sleep(5)
+                        time.sleep(1)
                     # Each thread calls ensure_session() internally for thread safety
                     future = executor.submit(
                         provision_account, org_profile, name, email,
@@ -907,7 +907,7 @@ def main():
         print(f"📊 Pool account summary")
         print(f"{'='*60}")
         session = ensure_session(org_profile)
-        print_pool_summary(session)
+        print_pool_summary(session, profile_name=org_profile)
 
 
 if __name__ == '__main__':

@@ -63,10 +63,11 @@ The script performs the following steps:
 2. **📋 List existing accounts** - Finds all `pool-NNN` accounts in the organization
 3. **🆕 Create new account** - Creates the next sequential pool account (e.g., `pool-009`)
 4. **📦 Move to Entry OU** - Moves the account to `ou-2laj-2by9v0sr` (Entry OU)
-5. **💰 Add to Billing View** - Adds the account to the custom billing view for cost tracking
-6. **📝 Register with Innovation Sandbox** - Calls the ISB API Gateway to register the account
-7. **🧹 Wait for cleanup** - Polls until the account is moved to `ou-2laj-oihxgbtr` (Ready OU)
-8. **🎉 Report** - Displays total time taken
+5. **⏳ StackSet + 🏷️ Tag + 📝 Register (parallel)** - Waits for StackSet deployment while simultaneously tagging the account and registering it with the ISB API
+6. **🛡️ Deploy SCPs** - Dispatches the SCP Terraform workflow
+7. **🎉 Report** - Displays total time taken
+
+The ISB cleanup pipeline moves accounts to the Available OU autonomously, so the script does not wait for that.
 
 ## Account naming
 
@@ -87,10 +88,6 @@ The following constants can be modified in the script:
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `ENTRY_OU` | `ou-2laj-2by9v0sr` | OU where new accounts are placed for registration |
-| `SANDBOX_READY_OU` | `ou-2laj-oihxgbtr` | OU where accounts are moved after cleanup |
-| `BILLING_VIEW_ARN` | `arn:aws:billing::955063685555:billingview/custom-...` | Custom billing view for cost tracking |
-| `check_interval` | `5` seconds | How often to check for OU move |
-| `max_wait` | `3600` seconds (1 hour) | Maximum time to wait for cleanup |
 
 ### How it works
 
@@ -100,27 +97,13 @@ The script authenticates to the Innovation Sandbox API Gateway using a properly 
 
 ```
 ============================================================
-🔑 STEP 1: AWS SSO Authentication
+🔑 AWS SSO Authentication
 ============================================================
   ✅ NDX/orgManagement - session valid
   ✅ NDX/InnovationSandboxHub - session valid
 
 ============================================================
-📋 STEP 2: List existing pool accounts
-============================================================
-Fetching accounts from AWS Organizations...
-
-📊 Found 8 accounts starting with 'pool-':
-
-Account ID      Name                                     Status       Email
-----------------------------------------------------------------------------------------------------
-449788867583    pool-001                                 ACTIVE       ndx-try-provider+gds-ndx-try-aws-pool-001@dsit.gov.uk
-...
-
-   Total: 8 pool accounts
-
-============================================================
-🆕 STEP 3: Create new account
+🆕 Create account: pool-009
 ============================================================
    Account name: pool-009
    Email: ndx-try-provider+gds-ndx-try-aws-pool-009@dsit.gov.uk
@@ -128,40 +111,34 @@ Account ID      Name                                     Status       Email
    ✅ Account created: 123456789012
 
 ============================================================
-📦 STEP 4: Move to Entry OU
+📦 Move to Entry OU: pool-009
 ============================================================
    📍 From: r-2laj
    📍 To:   ou-2laj-2by9v0sr
    ✅ Move complete
 
 ============================================================
-💰 STEP 4.5: Add to Billing View
+⏳ StackSet + Tag + Register (parallel): pool-009
 ============================================================
-   📊 Fetching current billing view...
-   📝 Adding account (total will be 9 accounts)
-   ✅ Added account to billing view
-
-============================================================
-📝 STEP 5: Register with Innovation Sandbox
-============================================================
-   🔑 Fetching JWT secret...
+   ✅ StackSet deployed (SandboxAccountRole ready)
+   ✅ Tagged with do-not-separate
    🎯 Account: 123456789012
    🌐 API: https://your-isb-api-gateway-url/accounts
    ✅ Registered successfully!
-   📄 Status: CleanUp
+
+✅ Provisioning complete for pool-009 (cleanup runs autonomously)
 
 ============================================================
-🧹 STEP 6: Wait for Innovation Sandbox cleanup
+🛡️  Deploy SCPs
 ============================================================
-⏳ Waiting for Innovation Sandbox cleanup...
-   Target OU: ou-2laj-oihxgbtr
-   ✅ Account moved to target OU after 8m 45s!
+   🚀 Dispatching SCP deployment...
+   ✅ SCP deployment completed successfully!
 
 ============================================================
 🎉 COMPLETE
 ============================================================
-   Account: pool-009 (123456789012)
-   ⏱️  Total time: 12m 34s
+   ✅ pool-009: 123456789012
+   ⏱️  Total time: 3m 12s
 ```
 
 ---
