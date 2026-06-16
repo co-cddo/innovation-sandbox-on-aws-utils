@@ -130,6 +130,9 @@ def main():
     parser.add_argument("--displayname", help="Display name (default: 'firstname lastname')")
     parser.add_argument("--preapproved", action="store_true",
                         help="Also add user to the pre-approved group for automated approval")
+    parser.add_argument("--resend-welcome", action="store_true",
+                        help="Send the welcome email/Slack alert even if the user was already "
+                             "a member of the group (forces a re-send)")
 
     args = parser.parse_args()
 
@@ -207,14 +210,31 @@ def main():
     print(f"👥 STEP 4: Add to {GROUP_NAME}")
     print("=" * 60)
 
+    added_to_group = False
     try:
         add_user_to_group(identity_store, identity_store_id, group_id, user_id)
         print(f"   ✅ Added to {GROUP_NAME}")
+        added_to_group = True
     except identity_store.exceptions.ConflictException:
         print(f"   ⚠️  Already a member of {GROUP_NAME}")
 
     # ── Notifications: Welcome email and Slack alert ─────────────────────
+    # Send the welcome whenever the user gained access this run: a brand-new
+    # user, OR an existing user just promoted off the waitlist (added to the
+    # group now). Skip for users who were already members, unless --resend-welcome
+    # forces it. This closes the gap where promoting a waitlisted user added them
+    # to the group but never sent the welcome email.
     if is_new_user:
+        action_label = "created"
+        slack_title = "New NDX User Created (CLI)"
+    elif added_to_group:
+        action_label = "promoted off the waitlist"
+        slack_title = "NDX User Promoted from Waitlist (CLI)"
+    else:
+        action_label = "re-notified"
+        slack_title = "NDX Welcome Re-sent (CLI)"
+
+    if is_new_user or added_to_group or args.resend_welcome:
         notification_lambda_arn, events_topic_arn = call_with_sso_retry(
             ISB_HUB_PROFILE, get_notification_arns,
         )
@@ -241,7 +261,7 @@ def main():
             "source": "custom",
             "content": {
                 "textType": "client-markdown",
-                "title": "New NDX User Created (CLI)",
+                "title": slack_title,
                 "description": f"*User:* {args.firstname} {args.lastname}\n*Email:* {args.email}",
             },
         })
@@ -256,7 +276,7 @@ def main():
                     Payload=welcome_payload,
                 ),
             )
-            print("   📧 Welcome email sent")
+            print(f"   📧 Welcome email sent (user {action_label})")
         except Exception as e:
             print(f"   ⚠️  Welcome email failed (non-blocking): {e}")
 
